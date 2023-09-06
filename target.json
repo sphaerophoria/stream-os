@@ -1,0 +1,25 @@
+{
+  "llvm-target": "i686-unknown-none",
+  "data-layout": "e-m:e-i32:32-f80:128-n8:16:32-S128-p:32:32",
+  "arch": "x86",
+  "target-endian": "little",
+  "target-pointer-width": "32",
+  "target-c-int-width": "32",
+  "os": "none",
+  "executables": true,
+  "linker-flavor": "gcc",
+  "linker": "i686-elf-gcc",
+  "panic-strategy": "abort",
+  "disable-redzone": true,
+  "features": "+soft-float,-sse",
+  "pre-link-args": {
+          "gcc": [
+                  "-Wl,--script=linker.ld",
+                  "-ffreestanding",
+                  "-O2",
+                  "-nostdlib",
+                  "-nostartfiles"
+          ]
+  }
+}
+
