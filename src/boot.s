@@ -70,15 +70,12 @@ _start:
 	mov $stack_top, %esp
 
 	/*
-	This is a good place to initialize crucial processor state before the
-	high-level kernel is entered. It's best to minimize the early
-	environment where crucial features are offline. Note that the
-	processor is not fully initialized yet: Features such as floating
-	point instructions and instruction set extensions are not initialized
-	yet. The GDT should be loaded here. Paging should be enabled here.
-	C++ features such as global constructors and exceptions will require
-	runtime support to work as well.
+	Multiboot info
+	kernel_main expects multiboot magic, multiboot info
+	Multiboot spec says those come in eax, ebx, push in reverse order before calling
 	*/
+	push %ebx
+	push %eax
 
 	/*
 	Enter the high-level kernel. The ABI requires the stack is 16-byte

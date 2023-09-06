@@ -1,9 +1,57 @@
-#![allow(bad_asm_style)]
+#![allow(bad_asm_style, clippy::missing_safety_doc)]
+#![feature(offset_of)]
 #![no_std] // don't link the Rust standard library
 #![no_main] // disable all Rust-level entry points
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;
+
+#[repr(C, packed)]
+pub struct MultibootInfo {
+    /* Multiboot info version number */
+    flags: u32,
+
+    /* Available memory from BIOS */
+    mem_lower: u32,
+    mem_upper: u32,
+
+    /* "root" partition */
+    boot_device: u32,
+
+    /* Kernel command line */
+    cmdline: u32,
+
+    /* Boot-Module list */
+    mods_count: u32,
+    mods_addr: u32,
+
+    dummy: [u8; 16],
+
+    /* Memory Mapping buffer */
+    mmap_length: u32,
+    mmap_addr: u32,
+
+    /* Drive Info buffer */
+    drives_length: u32,
+    drives_addr: u32,
+
+    /* ROM configuration table */
+    config_table: u32,
+
+    /* Boot Loader Name */
+    boot_loader_name: *const u8,
+
+    /* APM table */
+    apm_table: u32,
+}
+
+#[repr(C, packed)]
+struct MultibootMmapEntry {
+    size: u32,
+    addr: u64,
+    len: u64,
+    typ: u32,
+}
 
 // Include boot.s which defines _start as inline assembly in main. This allows us to do more fine
 // grained setup than if we used a naked _start function in rust. Theoretically we could use a
@@ -20,10 +68,20 @@ pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
 }
 
 #[no_mangle]
-pub extern "C" fn kernel_main() -> ! {
+pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const MultibootInfo) -> i32 {
     let mut terminal_writer = TerminalWriter::new();
-    terminal_writer.write(b"We did it, a rust kernel!");
-    loop {}
+    unsafe {
+        for i in 0..(*info).mmap_length {
+            let p = ((*info).mmap_addr + core::mem::size_of::<MultibootMmapEntry>() as u32 * i)
+                as *const MultibootMmapEntry;
+            terminal_writer.write(b"len: ");
+            terminal_writer.put_u32((*p).len as u32);
+            terminal_writer.write(b" addr: ");
+            terminal_writer.put_u32((*p).addr as u32);
+            terminal_writer.write(b"\n");
+        }
+    }
+    0
 }
 
 /// This function is called on panic.
@@ -75,8 +133,7 @@ impl TerminalWriter {
     fn new() -> TerminalWriter {
         let terminal_row = 0;
         let terminal_column = 0;
-        let terminal_color =
-            vga_entry_color(VgaColor::LightGrey, VgaColor::Black);
+        let terminal_color = vga_entry_color(VgaColor::LightGrey, VgaColor::Black);
         let terminal_buffer = 0xB8000 as *mut u16;
         for y in 0..VGA_HEIGHT {
             for x in 0..VGA_WIDTH {
@@ -107,7 +164,42 @@ impl TerminalWriter {
         }
     }
 
+    fn put_u32(&mut self, c: u32) {
+        let mut num_digits = 1;
+        loop {
+            // 1 -> break immediately
+            // 11 -> 1 iteration then break, num-digits 2
+            if c / 10_u32.pow(num_digits) == 0 {
+                break;
+            }
+
+            num_digits += 1;
+        }
+
+        for digit in (1..=num_digits).rev() {
+            // 120
+            //  ^
+            // 120 % 100
+            let c = (c / 10_u32.pow(digit - 1)) % 10;
+            self.putchar((c + 0x30) as u8);
+        }
+    }
+
+    fn put_i32(&mut self, mut c: i32) {
+        if c < 0 {
+            self.putchar(b'-');
+            c = -c;
+        }
+        self.put_u32(c as u32);
+    }
+
     fn putchar(&mut self, c: u8) {
+        if c == b'\n' {
+            self.terminal_row += 1;
+            self.terminal_column = 0;
+            return;
+        }
+
         self.putentryat(
             c,
             self.terminal_color,
