@@ -1,5 +1,5 @@
 with import <nixpkgs> {};
 
 mkShell {
-	buildInputs = [ grub2 xorriso qemu rustup ];
+	buildInputs = [ grub2 xorriso qemu rustup python3 ];
 }
