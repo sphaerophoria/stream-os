@@ -63,22 +63,19 @@ const VGA_WIDTH: usize = 80;
 const VGA_HEIGHT: usize = 25;
 
 pub struct TerminalWriter {
-    terminal_row: AtomicUsize,
-    terminal_column: AtomicUsize,
+    terminal_pos: AtomicUsize,
     terminal_color: AtomicU8,
     terminal_buffer: *mut u16,
 }
 
 impl TerminalWriter {
     const fn new() -> TerminalWriter {
-        let terminal_row = AtomicUsize::new(0);
-        let terminal_column = AtomicUsize::new(0);
+        let terminal_pos = AtomicUsize::new(0);
         let terminal_color = vga_entry_color(VgaColor::LightGrey, VgaColor::Black);
         let terminal_buffer = 0xB8000 as *mut u16;
 
         TerminalWriter {
-            terminal_row,
-            terminal_column,
+            terminal_pos,
             terminal_color: AtomicU8::new(terminal_color),
             terminal_buffer,
         }
@@ -102,30 +99,19 @@ impl TerminalWriter {
         self.terminal_color.store(color, Ordering::Relaxed);
     }
 
-    fn putentryat(&self, c: u8, color: u8, x: usize, y: usize) {
-        let index = y * VGA_WIDTH + x;
-        unsafe {
-            *self.terminal_buffer.add(index) = vga_entry(c, color);
-        }
-    }
-
     fn putchar(&self, c: u8) {
         if c == b'\n' {
-            self.terminal_row.fetch_add(1, Ordering::Relaxed);
-            self.terminal_column.store(0, Ordering::Relaxed);
+            let mut pos = self.terminal_pos.load(Ordering::Relaxed);
+            pos += VGA_WIDTH - (pos % VGA_WIDTH);
+            self.terminal_pos.store(pos, Ordering::Relaxed);
             return;
         }
 
-        let row = self.terminal_row.load(Ordering::Relaxed);
         let color = self.terminal_color.load(Ordering::Relaxed);
         // Increment col as we always try to advance the cursor after we write
-        let col = self.terminal_column.fetch_add(1, Ordering::Relaxed);
-        self.putentryat(c, color, col, row);
-        if col >= VGA_WIDTH {
-            self.terminal_column.store(0, Ordering::Relaxed);
-            if row == VGA_HEIGHT {
-                self.terminal_row.store(0, Ordering::Relaxed);
-            }
+        let pos = self.terminal_pos.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            *self.terminal_buffer.add(pos) = vga_entry(c, color);
         }
     }
 
