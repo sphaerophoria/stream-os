@@ -37,8 +37,9 @@ undefined behavior.
 .section .bss
 .align 16
 stack_bottom:
-.skip 16384 # 16 KiB
+.skip 16380 # 16 KiB - 4 bytes
 stack_top:
+.skip 4 # We define stack top as the last element in our stack, but this is after all allocated space. Add another 4 bytes for one more element
 
 /*
 The linker script specifies _start as the entry point to the kernel and the

@@ -37,29 +37,43 @@ pub struct MultibootInfo {
     apm_table: u32,
 }
 
+impl MultibootInfo {
+    pub unsafe fn get_mmap_addrs(&self) -> &[MultibootMmapEntry] {
+        let num_mmap_entries =
+            self.mmap_length as usize / core::mem::size_of::<MultibootMmapEntry>();
+        core::slice::from_raw_parts(
+            self.mmap_addr as *const MultibootMmapEntry,
+            num_mmap_entries,
+        )
+    }
+}
+
 #[repr(C, packed)]
+#[derive(Debug)]
 pub struct MultibootMmapEntry {
-    size: u32,
-    addr_low: u32,
-    addr_high: u32,
-    len_low: u32,
-    len_high: u32,
-    typ: u32,
+    pub size: u32,
+    pub addr: u64,
+    pub len: u64,
+    pub typ: u32,
 }
 
 pub unsafe fn print_mmap_sections(info: *const MultibootInfo) {
-    let mmap_length = (*info).mmap_length;
+    let num_mmap_addrs = (*info).mmap_length / core::mem::size_of::<MultibootMmapEntry>() as u32;
+    let boot_loader_name_slice = core::slice::from_raw_parts((*info).boot_loader_name, 4);
+    let boot_loader_str = core::str::from_utf8_unchecked(boot_loader_name_slice);
+    println!("{}", boot_loader_str);
     println!("Available memory segments...");
-    println!("mmap_length: {mmap_length}");
-    for i in 0..(*info).mmap_length {
-        let p = ((*info).mmap_addr + core::mem::size_of::<MultibootMmapEntry>() as u32 * i)
-            as *const MultibootMmapEntry;
-        let len = (*p).len_low;
-        let size = (*p).size;
+    println!("num_mmap_addrs: {num_mmap_addrs}");
+    let mut total_length = 0;
+    for entry in (*info).get_mmap_addrs() {
+        let len = entry.len as f32 / 1024.0;
+        let size = entry.size;
         if size == 0 {
-            break;
+            continue;
         }
-        let addr = (*p).addr_low;
-        println!("size: {size}, len: {len}, addr: {addr}");
+        let addr = entry.addr;
+        total_length += entry.len;
+        println!("size: {size}, len: {len}K, addr: {addr:#04X}");
     }
+    println!("total length: {}M", total_length as f32 / 1024.0 / 1024.0);
 }
