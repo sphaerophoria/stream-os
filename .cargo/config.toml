@@ -3,3 +3,6 @@ target = "target.json"
 
 [unstable]
 build-std = ["core", "compiler_builtins"]
+
+[target.'cfg(target_os = "none")']
+runner = "qemu-system-i386 -kernel"
