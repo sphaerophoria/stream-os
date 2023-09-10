@@ -8,28 +8,6 @@ use core::{
 // pointer without crashing
 pub static TERMINAL_WRITER: TerminalWriter = TerminalWriter::new();
 
-macro_rules! print {
-    ($($arg:tt)*) => {
-        #[allow(unused_unsafe)]
-        unsafe {
-            use $crate::vga::TerminalWriter;
-            use core::fmt::Write as FmtWrite;
-            let writer = &$crate::vga::TERMINAL_WRITER as *const TerminalWriter;
-            // write_fmt needs writer as &mut, but we only access it as *const. Cast to fulfil the
-            // API requirements
-            let writer = writer as *mut TerminalWriter;
-            write!(&mut *(writer), $($arg)*).expect("Failed to print")
-        }
-    }
-}
-
-macro_rules! println {
-    ($($arg:tt)*) => {
-        print!($($arg)*);
-        print!("\n");
-    }
-}
-
 /* Hardware text mode color constants. */
 #[allow(dead_code)]
 enum VgaColor {

@@ -6,17 +6,19 @@
 extern crate alloc;
 
 #[macro_use]
-mod vga;
+mod io;
 mod allocator;
 mod libc;
 mod multiboot;
 
 use alloc::{vec, vec::Vec};
 use core::sync::atomic::Ordering;
+use io::vga::TerminalWriter;
 use multiboot::MultibootInfo;
-use vga::TerminalWriter;
 
 use core::{arch::global_asm, panic::PanicInfo};
+
+use crate::io::serial::Serial;
 
 #[global_allocator]
 static ALLOC: allocator::Allocator = allocator::Allocator::new();
@@ -34,6 +36,7 @@ extern "C" {
 #[no_mangle]
 pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const MultibootInfo) -> i32 {
     TerminalWriter::init();
+    Serial::init().expect("Failed to initialize serial");
 
     println!(
         "Kernel start {:?}, Kernel end {:?}",
