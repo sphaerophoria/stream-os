@@ -5,4 +5,4 @@ target = "target.json"
 build-std = ["core", "compiler_builtins", "alloc" ]
 
 [target.'cfg(target_os = "none")']
-runner = "qemu-system-i386 -serial stdio -kernel"
+runner = "./qemu_wrapper.sh"

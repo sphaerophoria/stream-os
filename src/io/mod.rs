@@ -49,3 +49,8 @@ unsafe fn outb(addr: u16, val: u8) {
         in("dx") addr,
         in("al") val);
 }
+
+pub unsafe fn exit(code: u8) {
+    const ISA_DEBUG_EXIT_PORT: u16 = 0xf4;
+    outb(ISA_DEBUG_EXIT_PORT, code);
+}

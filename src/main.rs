@@ -100,6 +100,7 @@ pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const Multibo
         multiboot::print_mmap_sections(info);
     }
 
+    io::exit(0);
     0
 }
 
@@ -111,5 +112,10 @@ fn panic(panic_info: &PanicInfo) -> ! {
     } else {
         println!("Paniced!");
     }
+
+    unsafe {
+        io::exit(1);
+    }
+
     loop {}
 }
