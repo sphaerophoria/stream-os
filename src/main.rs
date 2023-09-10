@@ -19,12 +19,9 @@ mod libc;
 mod multiboot;
 
 use alloc::vec;
-use io::vga::TerminalWriter;
 use multiboot::MultibootInfo;
 
 use core::{arch::global_asm, panic::PanicInfo};
-
-use crate::io::serial::Serial;
 
 // Include boot.s which defines _start as inline assembly in main. This allows us to do more fine
 // grained setup than if we used a naked _start function in rust. Theoretically we could use a
@@ -38,8 +35,8 @@ extern "C" {
 
 #[no_mangle]
 pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const MultibootInfo) -> i32 {
-    TerminalWriter::init();
-    Serial::init().expect("Failed to initialize serial");
+    io::vga::init();
+    io::serial::init().expect("Failed to initialize serial");
     allocator::ALLOC.init(&*info);
 
     #[cfg(test)]
