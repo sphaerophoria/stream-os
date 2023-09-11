@@ -64,35 +64,35 @@ impl Allocator {
             first_free: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
+}
 
-    pub unsafe fn init(&self, info: &MultibootInfo) {
-        assert_eq!(
-            core::mem::size_of::<UsedSegment>(),
-            core::mem::size_of::<FreeSegment>()
-        );
+pub unsafe fn init(info: &MultibootInfo) {
+    assert_eq!(
+        core::mem::size_of::<UsedSegment>(),
+        core::mem::size_of::<FreeSegment>()
+    );
 
-        let big_block = info
-            .get_mmap_addrs()
-            .iter()
-            .find(|entry| entry.addr == (&crate::KERNEL_START) as *const u32 as u64);
+    let big_block = info
+        .get_mmap_addrs()
+        .iter()
+        .find(|entry| entry.addr == (&crate::KERNEL_START) as *const u32 as u64);
 
-        let big_block = big_block.expect("Failed to find big block of ram");
-        let kernel_end_addr = (&crate::KERNEL_END as *const u32) as u64;
-        let kernel_start_addr = (&crate::KERNEL_START as *const u32) as u64;
-        let reserved_memory_length = (kernel_end_addr - kernel_start_addr) as usize;
+    let big_block = big_block.expect("Failed to find big block of ram");
+    let kernel_end_addr = (&crate::KERNEL_END as *const u32) as u64;
+    let kernel_start_addr = (&crate::KERNEL_START as *const u32) as u64;
+    let reserved_memory_length = (kernel_end_addr - kernel_start_addr) as usize;
 
-        let segment_size =
-            big_block.len as usize - reserved_memory_length - core::mem::size_of::<FreeSegment>();
+    let segment_size =
+        big_block.len as usize - reserved_memory_length - core::mem::size_of::<FreeSegment>();
 
-        let segment = &crate::KERNEL_END as *const u32;
-        let segment = segment as *mut FreeSegment;
-        *segment = FreeSegment {
-            size: segment_size,
-            next_segment: core::ptr::null_mut(),
-        };
+    let segment = &crate::KERNEL_END as *const u32;
+    let segment = segment as *mut FreeSegment;
+    *segment = FreeSegment {
+        size: segment_size,
+        next_segment: core::ptr::null_mut(),
+    };
 
-        self.first_free.store(segment, Ordering::Relaxed);
-    }
+    ALLOC.first_free.store(segment, Ordering::Relaxed);
 }
 
 unsafe fn find_header_for_allocation(segment: &FreeSegment, layout: &Layout) -> Option<*mut u8> {

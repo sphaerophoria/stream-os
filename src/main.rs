@@ -37,7 +37,7 @@ extern "C" {
 pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const MultibootInfo) -> i32 {
     io::vga::init();
     io::serial::init().expect("Failed to initialize serial");
-    allocator::ALLOC.init(&*info);
+    allocator::init(&*info);
 
     #[cfg(test)]
     {
