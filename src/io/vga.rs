@@ -35,21 +35,20 @@ const VGA_HEIGHT: usize = 25;
 pub struct TerminalWriter {
     terminal_pos: usize,
     terminal_color: u8,
-    terminal_buffer: *mut u16,
+    terminal_buffer: &'static mut [u16],
 }
 
 impl TerminalWriter {
     pub fn new() -> TerminalWriter {
         let terminal_pos = 0;
         let terminal_color = vga_entry_color(VgaColor::LightGrey, VgaColor::Black);
-        let terminal_buffer = 0xB8000 as *mut u16;
+        let terminal_buffer =
+            unsafe { core::slice::from_raw_parts_mut(0xB8000 as *mut u16, VGA_WIDTH * VGA_HEIGHT) };
 
         for y in 0..VGA_HEIGHT {
             for x in 0..VGA_WIDTH {
                 let index = y * VGA_WIDTH + x;
-                unsafe {
-                    *terminal_buffer.add(index) = vga_entry(b' ', terminal_color);
-                }
+                terminal_buffer[index] = vga_entry(b' ', terminal_color);
             }
         }
 
@@ -71,11 +70,9 @@ impl TerminalWriter {
             return;
         }
 
-        unsafe {
-            *self.terminal_buffer.add(self.terminal_pos) = vga_entry(c, self.terminal_color);
-            self.terminal_pos += 1;
-            self.terminal_pos %= VGA_WIDTH * VGA_HEIGHT;
-        }
+        self.terminal_buffer[self.terminal_pos] = vga_entry(c, self.terminal_color);
+        self.terminal_pos += 1;
+        self.terminal_pos %= VGA_WIDTH * VGA_HEIGHT;
     }
 
     fn write(&mut self, data: &[u8]) {
