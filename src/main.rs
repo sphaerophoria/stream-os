@@ -10,11 +10,12 @@
 extern crate alloc;
 
 #[macro_use]
-mod io;
-#[cfg(test)]
+mod print;
 #[macro_use]
+#[cfg(test)]
 mod testing;
 mod allocator;
+mod io;
 mod libc;
 mod multiboot;
 
@@ -50,6 +51,14 @@ pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const Multibo
     let a_map: hashbrown::HashMap<&'static str, i32> =
         [("test", 1), ("test2", 2)].into_iter().collect();
     println!("A map: {:?}", a_map);
+
+    let mut rtc = io::rtc::Rtc::new(&mut port_manager).expect("Failed to construct rtc");
+    let mut date = rtc.read();
+    println!("Current date: {:?}", date);
+    date.hours -= 1;
+    rtc.write(&date);
+    let date = rtc.read();
+    println!("Current date modified in cmos: {:?}", date);
 
     println!("And now we exit/halt");
 
