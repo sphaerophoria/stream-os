@@ -46,17 +46,12 @@ pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const Multibo
         io::exit(0);
     }
 
-    println!(
-        "Kernel start {:?}, Kernel end {:?}",
-        &KERNEL_START as *const u32, &KERNEL_END as *const u32
-    );
+    println!("A vector: {:?}", vec![1, 2, 3, 4, 5]);
+    let a_map: hashbrown::HashMap<&'static str, i32> =
+        [("test", 1), ("test2", 2)].into_iter().collect();
+    println!("A map: {:?}", a_map);
 
-    let v = vec![1, 2, 3, 4, 5];
-    println!("{:?}", v);
-
-    unsafe {
-        multiboot::print_mmap_sections(info);
-    }
+    println!("And now we exit/halt");
 
     io::exit(0);
     0
