@@ -35,9 +35,10 @@ extern "C" {
 
 #[no_mangle]
 pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const MultibootInfo) -> i32 {
-    io::vga::init();
-    io::serial::init().expect("Failed to initialize serial");
     allocator::init(&*info);
+    let mut port_manager = io::port_manager::PortManager::new();
+    io::init_stdio(&mut port_manager);
+    io::init_late(&mut port_manager);
 
     #[cfg(test)]
     {

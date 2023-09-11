@@ -6,4 +6,6 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+hashbrown = "0.14.0"
 paste = "1.0.14"
+thiserror-no-std = "2.0.2"

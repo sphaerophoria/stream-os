@@ -8,7 +8,7 @@ pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn memcpy(d: *mut u8, s: *mut u8, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memcpy(d: *mut u8, s: *const u8, n: usize) -> *mut u8 {
     for i in 0..n {
         *d.add(i) = *s.add(i);
     }
@@ -25,4 +25,10 @@ pub unsafe extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
         }
     }
     0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) {
+    let copy = core::slice::from_raw_parts(src, n).to_vec();
+    core::ptr::copy(copy.as_ptr(), dest, n);
 }

@@ -1,32 +1,4 @@
-use core::{cell::RefCell, fmt::Write};
-
-// NOTE: This should be safe, TerminalWriter is synbc, and AtomicPtr satisfies the constraint on a
-// global. We initialize this at the start of main, so everyone else should be able to access the
-// pointer without crashing
-pub static TERMINAL_WRITER: StaticTerminalWriter = StaticTerminalWriter::new();
-
-pub struct StaticTerminalWriter {
-    inner: RefCell<TerminalWriter>,
-}
-
-impl core::ops::Deref for StaticTerminalWriter {
-    type Target = RefCell<TerminalWriter>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl StaticTerminalWriter {
-    const fn new() -> StaticTerminalWriter {
-        StaticTerminalWriter {
-            inner: RefCell::new(TerminalWriter::new()),
-        }
-    }
-}
-
-// For now our statics are only accessed from a single thread
-unsafe impl Sync for StaticTerminalWriter {}
+use core::fmt::Write;
 
 /* Hardware text mode color constants. */
 #[allow(dead_code)]
@@ -60,18 +32,6 @@ const fn vga_entry(uc: u8, color: u8) -> u16 {
 const VGA_WIDTH: usize = 80;
 const VGA_HEIGHT: usize = 25;
 
-pub fn init() {
-    let terminal = TERMINAL_WRITER.borrow_mut();
-    for y in 0..VGA_HEIGHT {
-        for x in 0..VGA_WIDTH {
-            let index = y * VGA_WIDTH + x;
-            unsafe {
-                *terminal.terminal_buffer.add(index) = vga_entry(b' ', terminal.terminal_color);
-            }
-        }
-    }
-}
-
 pub struct TerminalWriter {
     terminal_pos: usize,
     terminal_color: u8,
@@ -79,10 +39,19 @@ pub struct TerminalWriter {
 }
 
 impl TerminalWriter {
-    const fn new() -> TerminalWriter {
+    pub fn new() -> TerminalWriter {
         let terminal_pos = 0;
         let terminal_color = vga_entry_color(VgaColor::LightGrey, VgaColor::Black);
         let terminal_buffer = 0xB8000 as *mut u16;
+
+        for y in 0..VGA_HEIGHT {
+            for x in 0..VGA_WIDTH {
+                let index = y * VGA_WIDTH + x;
+                unsafe {
+                    *terminal_buffer.add(index) = vga_entry(b' ', terminal_color);
+                }
+            }
+        }
 
         TerminalWriter {
             terminal_pos,
