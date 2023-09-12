@@ -1,4 +1,4 @@
-#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::missing_safety_doc, named_asm_labels)]
 #![feature(panic_info_message)]
 #![feature(concat_idents)]
 #![no_std]
@@ -15,9 +15,11 @@ mod print;
 #[cfg(test)]
 mod testing;
 mod allocator;
+mod gdt;
 mod io;
 mod libc;
 mod multiboot;
+mod util;
 
 use alloc::vec;
 use multiboot::MultibootInfo;
@@ -46,6 +48,12 @@ pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const Multibo
         test_main();
         io::exit(0);
     }
+
+    println!("Initial gdt");
+    gdt::print_gdt();
+    gdt::init();
+    println!("Updated gdt");
+    gdt::print_gdt();
 
     println!("A vector: {:?}", vec![1, 2, 3, 4, 5]);
     let a_map: hashbrown::HashMap<&'static str, i32> =
