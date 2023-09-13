@@ -67,6 +67,7 @@ impl TerminalWriter {
     fn putchar(&mut self, c: u8) {
         if c == b'\n' {
             self.terminal_pos += VGA_WIDTH - (self.terminal_pos % VGA_WIDTH);
+            self.terminal_pos %= VGA_WIDTH * VGA_HEIGHT;
             return;
         }
 
