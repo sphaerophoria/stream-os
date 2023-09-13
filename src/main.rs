@@ -1,4 +1,4 @@
-#![allow(bad_asm_style, clippy::missing_safety_doc)]
+#![allow(clippy::missing_safety_doc)]
 #![feature(panic_info_message)]
 #![feature(concat_idents)]
 #![no_std]
@@ -27,7 +27,7 @@ use core::{arch::global_asm, panic::PanicInfo};
 // Include boot.s which defines _start as inline assembly in main. This allows us to do more fine
 // grained setup than if we used a naked _start function in rust. Theoretically we could use a
 // naked function + some inline asm, but this seems much more straight forward.
-global_asm!(include_str!("boot.s"));
+global_asm!(include_str!("boot.s"), options(att_syntax));
 
 extern "C" {
     static KERNEL_START: u32;

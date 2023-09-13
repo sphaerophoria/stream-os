@@ -30,11 +30,11 @@ impl Port {
     pub fn writeb(&mut self, val: u8) {
         unsafe {
             asm!(r#"
-                .att_syntax
                 out %al, %dx
                 "#,
                 in("dx") self.addr,
-                in("al") val);
+                in("al") val,
+                options(att_syntax));
         }
     }
 
@@ -42,11 +42,11 @@ impl Port {
         unsafe {
             let mut ret;
             asm!(r#"
-                .att_syntax
                 in %dx, %al
                 "#,
                 in("dx") self.addr,
-                out("al") ret);
+                out("al") ret,
+                options(att_syntax));
             ret
         }
     }
