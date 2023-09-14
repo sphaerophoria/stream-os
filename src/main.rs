@@ -2,6 +2,8 @@
 #![feature(panic_info_message)]
 #![feature(concat_idents)]
 #![feature(abi_x86_interrupt)]
+#![feature(maybe_uninit_uninit_array)]
+#![feature(const_maybe_uninit_uninit_array)]
 #![no_std]
 #![no_main]
 #![feature(custom_test_frameworks)]
@@ -12,6 +14,8 @@ extern crate alloc;
 
 #[macro_use]
 mod print;
+#[macro_use]
+mod logger;
 #[macro_use]
 #[cfg(test)]
 mod testing;
@@ -29,6 +33,8 @@ use multiboot::MultibootInfo;
 
 use core::{arch::global_asm, panic::PanicInfo};
 
+use crate::util::interrupt_guard::InterruptGuarded;
+
 // Include boot.s which defines _start as inline assembly in main. This allows us to do more fine
 // grained setup than if we used a naked _start function in rust. Theoretically we could use a
 // naked function + some inline asm, but this seems much more straight forward.
@@ -41,7 +47,13 @@ extern "C" {
 
 #[no_mangle]
 pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const MultibootInfo) -> i32 {
+    // Disable interrupts until interrupts are initialized
+    let interrupt_guard = InterruptGuarded::new(());
+    let interrupt_guard = interrupt_guard.lock();
+
     allocator::init(&*info);
+    logger::init(Default::default());
+
     let mut port_manager = io::port_manager::PortManager::new();
     io::init_stdio(&mut port_manager);
     io::init_late(&mut port_manager);
@@ -52,29 +64,28 @@ pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const Multibo
         io::exit(0);
     }
 
-    println!("Initial gdt");
-    gdt::print_gdt();
     gdt::init();
-    println!("Updated gdt");
-    gdt::print_gdt();
 
     interrupts::init(&mut port_manager);
-    interrupt!(16);
+    drop(interrupt_guard);
+    interrupt!(11);
 
-    println!("A vector: {:?}", vec![1, 2, 3, 4, 5]);
+    info!("A vector: {:?}", vec![1, 2, 3, 4, 5]);
     let a_map: hashbrown::HashMap<&'static str, i32> =
         [("test", 1), ("test2", 2)].into_iter().collect();
-    println!("A map: {:?}", a_map);
+    info!("A map: {:?}", a_map);
 
     let mut rtc = io::rtc::Rtc::new(&mut port_manager).expect("Failed to construct rtc");
     let mut date = rtc.read();
-    println!("Current date: {:?}", date);
+    info!("Current date: {:?}", date);
     date.hours -= 1;
     rtc.write(&date);
     let date = rtc.read();
-    println!("Current date modified in cmos: {:?}", date);
+    info!("Current date modified in cmos: {:?}", date);
 
-    println!("And now we exit/halt");
+    info!("And now we exit/halt");
+
+    logger::service();
 
     io::exit(0);
     0

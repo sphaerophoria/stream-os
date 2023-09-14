@@ -52,11 +52,11 @@ impl InterruptTable {
 unsafe impl Sync for InterruptTable {}
 
 extern "x86-interrupt" fn general_fault_handler() {
-    println!("Hi");
+    info!("Hi");
 }
 
 extern "x86-interrupt" fn double_fault_handler() {
-    panic!("Double fault");
+    info!("Double fault");
 }
 
 fn read_idtr() -> Idt {
@@ -116,15 +116,14 @@ pub fn init(port_manager: &mut PortManager) {
         offset: table_ptr as u32,
     };
 
-    println!("{:?}", read_idtr());
+    debug!("{:?}", read_idtr());
     unsafe {
         asm!(r#"
              lidt ({idt})
-             sti
              "#,
              idt = in (reg) &idt,
              options(att_syntax));
     }
 
-    println!("{:?}", read_idtr());
+    debug!("{:?}", read_idtr());
 }

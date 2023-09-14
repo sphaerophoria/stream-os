@@ -147,16 +147,16 @@ fn read_gdtr() -> Gdt {
     }
 }
 
-pub unsafe fn print_gdt() {
+pub unsafe fn debug_print_gdt() {
     let gdt = read_gdtr();
     let limit = gdt.limit;
     let base = gdt.base as *const GdtSegment;
     let limit = limit + 1;
-    println!("base: {base:?}, limit: {limit:#x}");
+    debug!("base: {base:?}, limit: {limit:#x}");
     for i in 0..(limit / 8) {
-        println!("Segment {i}");
+        debug!("Segment {i}");
         let segment = *base.add(i.into());
-        println!(
+        debug!(
             "base: {:#x}, limit: {:#x}, access: {:#x}, flags: {:#x}",
             segment.base(),
             segment.limit(),
@@ -168,6 +168,9 @@ pub unsafe fn print_gdt() {
 
 // Caller responsible for setting interrupt flags
 pub unsafe fn init() {
+    debug!("Initial gdt");
+    debug_print_gdt();
+
     let mut entries = GDT_ENTRIES.borrow_mut();
     *entries = get_gdt_vals().to_vec();
     let entry_ptr: *const GdtSegment = entries.as_ptr();
@@ -209,6 +212,9 @@ pub unsafe fn init() {
              reload_reg = out (reg) _,
              options(att_syntax));
     }
+
+    debug!("Updated gdt");
+    debug_print_gdt();
 }
 
 #[cfg(test)]

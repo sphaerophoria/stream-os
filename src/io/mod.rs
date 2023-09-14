@@ -64,7 +64,7 @@ pub fn init_stdio(port_manager: &mut PortManager) {
     sinks.serial = match Serial::new(port_manager) {
         Ok(v) => Some(v),
         Err(e) => {
-            println!("Failed to initialize serial output: {e}");
+            error!("Failed to initialize serial output: {}", e);
             None
         }
     }
