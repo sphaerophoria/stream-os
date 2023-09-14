@@ -196,8 +196,8 @@ pub unsafe fn init() {
 
         asm!(r#"
              lgdt ({gdt})
-             jmp $0x08, $.reload_segment_regs
-             .reload_segment_regs:
+             jmp $0x08, $1f
+             1:
              mov $0x10, {reload_reg}
              mov {reload_reg}, %ds
              mov {reload_reg}, %es
