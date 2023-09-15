@@ -30,6 +30,10 @@ impl<T, const N: usize> CircularArray<T, N> {
 
         wrapping_increment(&mut self.head, N);
 
+        if self.tail == N + 1 {
+            self.tail = index;
+        }
+
         let mut ret = MaybeUninit::uninit();
         core::mem::swap(&mut ret, &mut self.array[index]);
         unsafe { Some(ret.assume_init()) }
@@ -86,6 +90,20 @@ mod test {
         test_true!(buffer.push_back(1).is_ok());
         test_eq!(buffer.pop_front(), Some(1));
         test_true!(buffer.pop_front().is_none());
+        Ok(())
+    });
+
+    create_test!(full_then_not_full, {
+        let mut buffer: CircularArray<i32, 3> = CircularArray::new();
+        test_true!(buffer.push_back(1).is_ok());
+        test_true!(buffer.push_back(2).is_ok());
+        test_true!(buffer.push_back(3).is_ok());
+        test_true!(buffer.push_back(4).is_err());
+        test_eq!(buffer.pop_front(), Some(1));
+        test_true!(buffer.push_back(4).is_ok());
+        test_eq!(buffer.pop_front(), Some(2));
+        test_eq!(buffer.pop_front(), Some(3));
+        test_eq!(buffer.pop_front(), Some(4));
         Ok(())
     });
 }
