@@ -1,4 +1,11 @@
-use crate::io::{Port, PortManager};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::{
+    interrupts::InterruptHandlerData,
+    io::{Port, PortManager},
+    util::interrupt_guard::InterruptGuarded,
+};
+use alloc::sync::Arc;
 use thiserror_no_std::Error;
 
 const NMI_ENABLE: bool = true;
@@ -27,26 +34,24 @@ fn select_reg(control_port: &mut Port, nmi_enable: bool, reg: u8) {
     control_port.writeb(get_nmi_mask(nmi_enable) | reg);
 }
 
-fn read_cmos_reg(control_port: &mut Port, data_port: &mut Port, nmi_enable: bool, reg: u8) -> u8 {
-    select_reg(control_port, nmi_enable, reg);
-    data_port.readb()
+fn read_cmos_reg(ports: &mut Ports, nmi_enable: bool, reg: u8) -> u8 {
+    select_reg(&mut ports.cmos_nmi_control_port, nmi_enable, reg);
+    ports.cmos_data_port.readb()
 }
 
-fn write_cmos_reg(
-    control_port: &mut Port,
-    data_port: &mut Port,
-    nmi_enable: bool,
-    reg: u8,
-    val: u8,
-) {
-    select_reg(control_port, nmi_enable, reg);
-    data_port.writeb(val);
+fn write_cmos_reg(ports: &mut Ports, nmi_enable: bool, reg: u8, val: u8) {
+    select_reg(&mut ports.cmos_nmi_control_port, nmi_enable, reg);
+    ports.cmos_data_port.writeb(val);
 }
 
-fn update_in_progress(control_port: &mut Port, data_port: &mut Port, nmi_enable: bool) -> bool {
+fn update_in_progress(ports: &mut Ports, nmi_enable: bool) -> bool {
     const STATUS_REG_A_NUM: u8 = 0x0a;
-    select_reg(control_port, nmi_enable, STATUS_REG_A_NUM);
-    in_progress_set(data_port.readb())
+    select_reg(
+        &mut ports.cmos_nmi_control_port,
+        nmi_enable,
+        STATUS_REG_A_NUM,
+    );
+    in_progress_set(ports.cmos_data_port.readb())
 }
 
 fn in_progress_set(status_reg_a: u8) -> bool {
@@ -54,40 +59,37 @@ fn in_progress_set(status_reg_a: u8) -> bool {
     status_reg_a & IN_PROGRESS_MASK == IN_PROGRESS_MASK
 }
 
-fn set_data_format(cmos_nmi_control_port: &mut Port, cmos_data_port: &mut Port, nmi_enable: bool) {
+fn enable_interrupts(ports: &mut Ports) {
+    let prev = read_cmos_reg(ports, NMI_ENABLE, 0x8b);
+    write_cmos_reg(ports, NMI_ENABLE, 0x8b, prev | 0x40);
+}
+
+fn set_interrupt_rate(ports: &mut Ports) {
+    // See MC146818 docs for rate control, set up 256 Hz
+    let mut data = read_cmos_reg(ports, NMI_ENABLE, 0x0a);
+    data = (data & 0xf0) | 1;
+    write_cmos_reg(ports, NMI_ENABLE, 0x0a, data);
+}
+
+fn set_data_format(ports: &mut Ports, nmi_enable: bool) {
     const STATUS_REG_B_NUM: u8 = 0x0b;
-    let mut status_reg = read_cmos_reg(
-        cmos_nmi_control_port,
-        cmos_data_port,
-        nmi_enable,
-        STATUS_REG_B_NUM,
-    );
+    let mut status_reg = read_cmos_reg(ports, nmi_enable, STATUS_REG_B_NUM);
     status_reg |= 1 << 1; // Enables 24 hour mode
     status_reg |= 1 << 2; // Enables binary format of retrieved values
 
-    write_cmos_reg(
-        cmos_nmi_control_port,
-        cmos_data_port,
-        nmi_enable,
-        STATUS_REG_B_NUM,
-        status_reg,
-    );
+    write_cmos_reg(ports, nmi_enable, STATUS_REG_B_NUM, status_reg);
 }
 
-fn update_guarded_op<R, F: Fn(&mut Port, &mut Port) -> R>(
-    control_port: &mut Port,
-    data_port: &mut Port,
-    f: F,
-) -> R {
+fn update_guarded_op<R, F: Fn(&mut Ports) -> R>(ports: &mut Ports, f: F) -> R {
     let mut ret;
     loop {
-        while update_in_progress(control_port, data_port, NMI_ENABLE) {
+        while update_in_progress(ports, NMI_ENABLE) {
             continue;
         }
 
-        ret = f(control_port, data_port);
+        ret = f(ports);
 
-        if update_in_progress(control_port, data_port, NMI_ENABLE) {
+        if update_in_progress(ports, NMI_ENABLE) {
             continue;
         }
 
@@ -104,70 +106,108 @@ pub enum RtcInitError {
     FailedToGetDataPort,
 }
 
-pub struct Rtc {
+struct Ports {
     cmos_nmi_control_port: Port,
     cmos_data_port: Port,
 }
 
-impl Rtc {
-    pub fn new(port_manager: &mut PortManager) -> Result<Rtc, RtcInitError> {
-        use RtcInitError::*;
-        let mut cmos_nmi_control_port = port_manager
+impl Ports {
+    fn new(port_manager: &mut PortManager) -> Result<Ports, RtcInitError> {
+        let cmos_nmi_control_port = port_manager
             .request_port(0x70)
-            .ok_or(FailedToGetControlPort)?;
-        let mut cmos_data_port = port_manager.request_port(0x71).ok_or(FailedToGetDataPort)?;
+            .ok_or(RtcInitError::FailedToGetControlPort)?;
+        let cmos_data_port = port_manager
+            .request_port(0x71)
+            .ok_or(RtcInitError::FailedToGetDataPort)?;
 
-        set_data_format(&mut cmos_nmi_control_port, &mut cmos_data_port, NMI_ENABLE);
-
-        Ok(Rtc {
+        Ok(Ports {
             cmos_nmi_control_port,
             cmos_data_port,
         })
     }
+}
+
+pub struct Rtc {
+    ports: Arc<InterruptGuarded<Ports>>,
+    tick: Arc<AtomicUsize>,
+}
+
+impl Rtc {
+    pub fn new(
+        port_manager: &mut PortManager,
+        interrupt_handlers: &InterruptHandlerData,
+    ) -> Result<Rtc, RtcInitError> {
+        let interrupt_guard = InterruptGuarded::new(());
+        let interrupt_guard = interrupt_guard.lock();
+
+        let mut ports = Ports::new(port_manager)?;
+
+        set_data_format(&mut ports, NMI_ENABLE);
+        set_interrupt_rate(&mut ports);
+        enable_interrupts(&mut ports);
+
+        let ports = Arc::new(InterruptGuarded::new(ports));
+        let tick = Arc::new(AtomicUsize::new(0));
+
+        interrupt_handlers.register(crate::interrupts::IrqId::Pic2(0), {
+            let ports = Arc::clone(&ports);
+            let tick = Arc::clone(&tick);
+            move || {
+                tick.fetch_add(1, Ordering::Relaxed);
+
+                // Clear interrupt mask on rtc
+                read_cmos_reg(&mut ports.lock(), NMI_ENABLE, 0x0c);
+            }
+        });
+
+        drop(interrupt_guard);
+
+        Ok(Rtc { ports, tick })
+    }
 
     pub fn write(&mut self, date_time: &DateTime) {
-        update_guarded_op(
-            &mut self.cmos_nmi_control_port,
-            &mut self.cmos_data_port,
-            |control_port, data_port| {
-                write_cmos_reg(control_port, data_port, NMI_ENABLE, 0x00, date_time.seconds);
-                write_cmos_reg(control_port, data_port, NMI_ENABLE, 0x02, date_time.minutes);
-                write_cmos_reg(control_port, data_port, NMI_ENABLE, 0x04, date_time.hours);
-                write_cmos_reg(control_port, data_port, NMI_ENABLE, 0x06, date_time.weekday);
-                write_cmos_reg(control_port, data_port, NMI_ENABLE, 0x07, date_time.day);
-                write_cmos_reg(control_port, data_port, NMI_ENABLE, 0x08, date_time.month);
-                write_cmos_reg(control_port, data_port, NMI_ENABLE, 0x09, date_time.year);
-                write_cmos_reg(control_port, data_port, NMI_ENABLE, 0x32, date_time.century);
-            },
-        );
+        update_guarded_op(&mut self.ports.lock(), |ports| {
+            write_cmos_reg(ports, NMI_ENABLE, 0x00, date_time.seconds);
+            write_cmos_reg(ports, NMI_ENABLE, 0x02, date_time.minutes);
+            write_cmos_reg(ports, NMI_ENABLE, 0x04, date_time.hours);
+            write_cmos_reg(ports, NMI_ENABLE, 0x06, date_time.weekday);
+            write_cmos_reg(ports, NMI_ENABLE, 0x07, date_time.day);
+            write_cmos_reg(ports, NMI_ENABLE, 0x08, date_time.month);
+            write_cmos_reg(ports, NMI_ENABLE, 0x09, date_time.year);
+            write_cmos_reg(ports, NMI_ENABLE, 0x32, date_time.century);
+        });
     }
 
     pub fn read(&mut self) -> DateTime {
-        update_guarded_op(
-            &mut self.cmos_nmi_control_port,
-            &mut self.cmos_data_port,
-            |control_port, data_port| {
-                let seconds = read_cmos_reg(control_port, data_port, NMI_ENABLE, 0x00);
-                let minutes = read_cmos_reg(control_port, data_port, NMI_ENABLE, 0x02);
-                let hours = read_cmos_reg(control_port, data_port, NMI_ENABLE, 0x04);
-                let weekday = read_cmos_reg(control_port, data_port, NMI_ENABLE, 0x06);
-                let day = read_cmos_reg(control_port, data_port, NMI_ENABLE, 0x07);
-                let month = read_cmos_reg(control_port, data_port, NMI_ENABLE, 0x08);
-                let year = read_cmos_reg(control_port, data_port, NMI_ENABLE, 0x09);
-                let century = read_cmos_reg(control_port, data_port, NMI_ENABLE, 0x32);
+        update_guarded_op(&mut self.ports.lock(), |ports| {
+            let seconds = read_cmos_reg(ports, NMI_ENABLE, 0x00);
+            let minutes = read_cmos_reg(ports, NMI_ENABLE, 0x02);
+            let hours = read_cmos_reg(ports, NMI_ENABLE, 0x04);
+            let weekday = read_cmos_reg(ports, NMI_ENABLE, 0x06);
+            let day = read_cmos_reg(ports, NMI_ENABLE, 0x07);
+            let month = read_cmos_reg(ports, NMI_ENABLE, 0x08);
+            let year = read_cmos_reg(ports, NMI_ENABLE, 0x09);
+            let century = read_cmos_reg(ports, NMI_ENABLE, 0x32);
 
-                DateTime {
-                    seconds,
-                    minutes,
-                    hours,
-                    weekday,
-                    day,
-                    month,
-                    year,
-                    century,
-                }
-            },
-        )
+            DateTime {
+                seconds,
+                minutes,
+                hours,
+                weekday,
+                day,
+                month,
+                year,
+                century,
+            }
+        })
+    }
+
+    pub fn tick_freq(&self) -> f32 {
+        256.0
+    }
+
+    pub fn get_tick(&self) -> usize {
+        self.tick.load(Ordering::Relaxed)
     }
 }
 

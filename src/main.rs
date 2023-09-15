@@ -29,6 +29,7 @@ mod multiboot;
 mod util;
 
 use alloc::vec;
+use io::rtc::Rtc;
 use multiboot::MultibootInfo;
 
 use core::{arch::global_asm, panic::PanicInfo};
@@ -45,6 +46,16 @@ extern "C" {
     static KERNEL_END: u32;
 }
 
+fn sleep(time_s: f32, rtc: &Rtc) {
+    // 256hz clock
+    let start = rtc.get_tick();
+    let end = start + (time_s * rtc.tick_freq()) as usize;
+    while rtc.get_tick() < end {
+        unsafe {
+            core::arch::asm!("hlt");
+        }
+    }
+}
 #[no_mangle]
 pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const MultibootInfo) -> i32 {
     // Disable interrupts until interrupts are initialized
@@ -66,22 +77,26 @@ pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const Multibo
 
     gdt::init();
 
-    interrupts::init(&mut port_manager);
+    let interrupt_handlers = interrupts::init(&mut port_manager);
     drop(interrupt_guard);
-    interrupt!(11);
 
     info!("A vector: {:?}", vec![1, 2, 3, 4, 5]);
     let a_map: hashbrown::HashMap<&'static str, i32> =
         [("test", 1), ("test2", 2)].into_iter().collect();
     info!("A map: {:?}", a_map);
 
-    let mut rtc = io::rtc::Rtc::new(&mut port_manager).expect("Failed to construct rtc");
+    let mut rtc =
+        io::rtc::Rtc::new(&mut port_manager, interrupt_handlers).expect("Failed to construct rtc");
     let mut date = rtc.read();
     info!("Current date: {:?}", date);
     date.hours -= 1;
     rtc.write(&date);
     let date = rtc.read();
     info!("Current date modified in cmos: {:?}", date);
+    info!("Sleep for 3 seconds");
+    logger::service();
+
+    sleep(3.0, &rtc);
 
     info!("And now we exit/halt");
 
