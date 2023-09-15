@@ -21,7 +21,7 @@ macro_rules! create_test {
         paste::paste! {
             #[test_case]
             static $name: TestCase = TestCase {
-                name: stringify!($name),
+                name: concat!(file!(), " ", stringify!($name)),
                 test: &[<$name _test>],
             };
             fn [<$name _test>]() -> Result<(), alloc::string::String> {
