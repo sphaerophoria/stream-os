@@ -20,21 +20,26 @@ mod logger;
 #[cfg(test)]
 mod testing;
 mod allocator;
+mod future;
 mod gdt;
 #[macro_use]
 mod interrupts;
 mod io;
 mod libc;
 mod multiboot;
+mod sleep;
+mod time;
 mod util;
 
-use alloc::vec;
-use io::rtc::Rtc;
+use alloc::{sync::Arc, vec};
 use multiboot::MultibootInfo;
 
 use core::{arch::global_asm, panic::PanicInfo};
 
-use crate::util::interrupt_guard::InterruptGuarded;
+use crate::{
+    future::execute_fut, io::rtc::Rtc, sleep::WakeupList, time::MonotonicTime,
+    util::interrupt_guard::InterruptGuarded,
+};
 
 // Include boot.s which defines _start as inline assembly in main. This allows us to do more fine
 // grained setup than if we used a naked _start function in rust. Theoretically we could use a
@@ -46,16 +51,6 @@ extern "C" {
     static KERNEL_END: u32;
 }
 
-fn sleep(time_s: f32, rtc: &Rtc) {
-    // 256hz clock
-    let start = rtc.get_tick();
-    let end = start + (time_s * rtc.tick_freq()) as usize;
-    while rtc.get_tick() < end {
-        unsafe {
-            core::arch::asm!("hlt");
-        }
-    }
-}
 #[no_mangle]
 pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const MultibootInfo) -> i32 {
     // Disable interrupts until interrupts are initialized
@@ -66,7 +61,13 @@ pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const Multibo
     logger::init(Default::default());
 
     let mut port_manager = io::port_manager::PortManager::new();
-    io::init_stdio(&mut port_manager);
+
+    gdt::init();
+
+    let interrupt_handlers = interrupts::init(&mut port_manager);
+    drop(interrupt_guard);
+
+    io::init_stdio(&mut port_manager, interrupt_handlers);
     io::init_late(&mut port_manager);
 
     #[cfg(test)]
@@ -75,18 +76,25 @@ pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const Multibo
         io::exit(0);
     }
 
-    gdt::init();
-
-    let interrupt_handlers = interrupts::init(&mut port_manager);
-    drop(interrupt_guard);
-
     info!("A vector: {:?}", vec![1, 2, 3, 4, 5]);
     let a_map: hashbrown::HashMap<&'static str, i32> =
         [("test", 1), ("test2", 2)].into_iter().collect();
     info!("A map: {:?}", a_map);
 
-    let mut rtc =
-        io::rtc::Rtc::new(&mut port_manager, interrupt_handlers).expect("Failed to construct rtc");
+    let monotonic_time = Arc::new(MonotonicTime::new(Rtc::tick_freq()));
+    let wakeup_list = Arc::new(WakeupList::new());
+    let on_tick = {
+        let monotonic_time = Arc::clone(&monotonic_time);
+        let wakeup_list = Arc::clone(&wakeup_list);
+
+        move || {
+            let tick = monotonic_time.increment();
+            wakeup_list.wakeup_if_neccessary(tick);
+        }
+    };
+
+    let mut rtc = io::rtc::Rtc::new(&mut port_manager, interrupt_handlers, on_tick)
+        .expect("Failed to construct rtc");
     let mut date = rtc.read();
     info!("Current date: {:?}", date);
     date.hours -= 1;
@@ -96,10 +104,10 @@ pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const Multibo
     info!("Sleep for 3 seconds");
     logger::service();
 
-    sleep(3.0, &rtc);
+    let fut = sleep::sleep(3.0, &monotonic_time, &wakeup_list);
+    execute_fut(fut);
 
     info!("And now we exit/halt");
-
     logger::service();
 
     io::exit(0);

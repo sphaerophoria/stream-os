@@ -1,4 +1,10 @@
-use crate::io::port_manager::{Port, PortManager};
+use core::task::Poll;
+
+use crate::{
+    future::wakeup_executor,
+    interrupts::{InterruptHandlerData, IrqId},
+    io::port_manager::{Port, PortManager},
+};
 
 use thiserror_no_std::Error;
 
@@ -38,7 +44,10 @@ pub struct Serial {
 }
 
 impl Serial {
-    pub fn new(port_manager: &mut PortManager) -> Result<Serial, SerialInitError> {
+    pub fn new(
+        port_manager: &mut PortManager,
+        interrupt_handlers: &InterruptHandlerData,
+    ) -> Result<Serial, SerialInitError> {
         use SerialInitError::*;
 
         let mut data = port_manager.request_port(BASE_ADDR).ok_or(DataReserved)?;
@@ -64,10 +73,16 @@ impl Serial {
             .request_port(BASE_ADDR + 7)
             .ok_or(ScratchReserved)?;
 
-        enable_interrupt.writeb(0x00); // Disable all interrupts
+        interrupt_handlers.register(IrqId::Pic1(4), {
+            move || {
+                wakeup_executor();
+            }
+        });
+
+        enable_interrupt.writeb(0x02); // Enable transmit empty
         line_control.writeb(0x80); // Enable DLAB (set baud rate divisor)
-        data.writeb(0x03); // Set divisor to 3 (lo byte) 38400 baud
-        enable_interrupt.writeb(0x00); //                  (hi byte)
+        data.writeb(0x00);
+        enable_interrupt.writeb(0x02);
         line_control.writeb(0x03); // 8 bits, no parity, one stop bit
         interrupt_id_fifo_control.writeb(0xC7); // Enable FIFO, clear them, with 14-byte threshold
         modem_control.writeb(0x0B); // IRQs enabled, RTS/DSR set
@@ -95,14 +110,52 @@ impl Serial {
         })
     }
 
-    fn is_transmit_empty(&mut self) -> u8 {
-        self.line_status.readb() & 0x20
+    #[allow(unused)]
+    async fn wait_transmit_empty(&mut self) {
+        if is_transmit_ready(&mut self.line_status) {
+            return;
+        }
+        let waiter = TransmitEmptyWaiter {
+            line_status: &mut self.line_status,
+        };
+        waiter.await;
     }
 
     fn write_byte(&mut self, a: u8) {
-        while self.is_transmit_empty() == 0 {}
+        while !is_transmit_ready(&mut self.line_status) {}
 
         self.data.writeb(a);
+    }
+
+    #[allow(unused)]
+    pub async fn write_str(&mut self, s: &str) {
+        for b in s.as_bytes() {
+            self.wait_transmit_empty().await;
+            self.write_byte(*b);
+        }
+    }
+}
+
+fn is_transmit_ready(line_status: &mut Port) -> bool {
+    (line_status.readb() & 0x20) != 0
+}
+
+struct TransmitEmptyWaiter<'a> {
+    line_status: &'a mut Port,
+}
+
+impl core::future::Future for TransmitEmptyWaiter<'_> {
+    type Output = ();
+
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        if is_transmit_ready(self.line_status) {
+            return Poll::Ready(());
+        }
+
+        Poll::Pending
     }
 }
 

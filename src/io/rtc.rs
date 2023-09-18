@@ -1,11 +1,10 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
-
 use crate::{
     interrupts::InterruptHandlerData,
     io::{Port, PortManager},
     util::interrupt_guard::InterruptGuarded,
 };
 use alloc::sync::Arc;
+
 use thiserror_no_std::Error;
 
 const NMI_ENABLE: bool = true;
@@ -80,6 +79,10 @@ fn set_data_format(ports: &mut Ports, nmi_enable: bool) {
     write_cmos_reg(ports, nmi_enable, STATUS_REG_B_NUM, status_reg);
 }
 
+fn clear_interrupt_mask(ports: &mut Ports) {
+    read_cmos_reg(ports, NMI_ENABLE, 0x0c);
+}
+
 fn update_guarded_op<R, F: Fn(&mut Ports) -> R>(ports: &mut Ports, f: F) -> R {
     let mut ret;
     loop {
@@ -98,6 +101,7 @@ fn update_guarded_op<R, F: Fn(&mut Ports) -> R>(ports: &mut Ports, f: F) -> R {
 
     ret
 }
+
 #[derive(Debug, Error)]
 pub enum RtcInitError {
     #[error("failed to get control port")]
@@ -129,13 +133,13 @@ impl Ports {
 
 pub struct Rtc {
     ports: Arc<InterruptGuarded<Ports>>,
-    tick: Arc<AtomicUsize>,
 }
 
 impl Rtc {
-    pub fn new(
+    pub fn new<F: Fn() + 'static>(
         port_manager: &mut PortManager,
         interrupt_handlers: &InterruptHandlerData,
+        on_tick: F,
     ) -> Result<Rtc, RtcInitError> {
         let interrupt_guard = InterruptGuarded::new(());
         let interrupt_guard = interrupt_guard.lock();
@@ -147,22 +151,18 @@ impl Rtc {
         enable_interrupts(&mut ports);
 
         let ports = Arc::new(InterruptGuarded::new(ports));
-        let tick = Arc::new(AtomicUsize::new(0));
 
         interrupt_handlers.register(crate::interrupts::IrqId::Pic2(0), {
             let ports = Arc::clone(&ports);
-            let tick = Arc::clone(&tick);
             move || {
-                tick.fetch_add(1, Ordering::Relaxed);
-
-                // Clear interrupt mask on rtc
-                read_cmos_reg(&mut ports.lock(), NMI_ENABLE, 0x0c);
+                on_tick();
+                clear_interrupt_mask(&mut ports.lock());
             }
         });
 
         drop(interrupt_guard);
 
-        Ok(Rtc { ports, tick })
+        Ok(Rtc { ports })
     }
 
     pub fn write(&mut self, date_time: &DateTime) {
@@ -202,12 +202,8 @@ impl Rtc {
         })
     }
 
-    pub fn tick_freq(&self) -> f32 {
+    pub fn tick_freq() -> f32 {
         256.0
-    }
-
-    pub fn get_tick(&self) -> usize {
-        self.tick.load(Ordering::Relaxed)
     }
 }
 

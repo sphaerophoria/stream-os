@@ -3,6 +3,8 @@ use port_manager::{Port, PortManager};
 use serial::Serial;
 use vga::TerminalWriter;
 
+use crate::interrupts::InterruptHandlerData;
+
 #[macro_use]
 pub mod vga;
 pub mod port_manager;
@@ -58,10 +60,10 @@ unsafe impl Sync for ExitPort {}
 
 static EXIT_PORT: ExitPort = ExitPort::new();
 
-pub fn init_stdio(port_manager: &mut PortManager) {
-    let mut sinks = STDOUT_SINKS.inner.borrow_mut();
+pub fn init_stdio(port_manager: &mut PortManager, interrupt_handlers: &InterruptHandlerData) {
+    let mut sinks = STDOUT_SINKS.borrow_mut();
     sinks.vga = Some(TerminalWriter::new());
-    sinks.serial = match Serial::new(port_manager) {
+    sinks.serial = match Serial::new(port_manager, interrupt_handlers) {
         Ok(v) => Some(v),
         Err(e) => {
             error!("Failed to initialize serial output: {}", e);
