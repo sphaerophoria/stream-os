@@ -441,31 +441,43 @@ impl InterruptHandlerData {
         *self.ports.lock() = Some(ports);
     }
 
-    pub fn register<F: Fn() + 'static>(&self, interrupt_num: IrqId, f: F) {
+    pub fn register<F: Fn() + 'static>(&self, irq_id: IrqId, f: F) {
         let mut ports = self.ports.lock();
         let ports = ports.as_mut().expect("InterruptHandlers not initialized");
 
-        let interrupt_num = match interrupt_num {
+        let interrupt_num = match irq_id {
             IrqId::Internal(i) => i,
+            IrqId::Pic1(i) => i + PIC1_OFFSET,
+            IrqId::Pic2(i) => i + PIC2_OFFSET,
+        };
+
+        {
+            let mut handlers = self.handlers.lock();
+
+            let handlers = handlers
+                .as_mut()
+                .expect("InterruptHandlers not initailized");
+
+            assert!(
+                !handlers.contains_key(&interrupt_num),
+                "Handlers should only be registered once per interrupt"
+            );
+            handlers.insert(interrupt_num, Box::new(f));
+        }
+
+        match irq_id {
             IrqId::Pic1(i) => {
                 let mut mask = ports.pic1_data.readb();
                 mask.set_bit(i, false);
                 ports.pic1_data.writeb(mask);
-                i + PIC1_OFFSET
             }
             IrqId::Pic2(i) => {
                 let mut mask = ports.pic2_data.readb();
                 mask.set_bit(i, false);
                 ports.pic2_data.writeb(mask);
-                i + PIC2_OFFSET
             }
+            _ => (),
         };
-
-        self.handlers
-            .lock()
-            .as_mut()
-            .expect("InterruptHandlers not initailized")
-            .insert(interrupt_num, Box::new(f));
     }
 }
 
