@@ -104,7 +104,7 @@ unsafe fn find_header_for_allocation(segment: &FreeSegment, layout: &Layout) -> 
     ptr = ptr.sub(core::mem::size_of::<UsedSegment>());
 
     if ptr < segment_start {
-        println!(
+        debug!(
             "Segment size too small, segment: {:?}, layout: {:?}",
             segment, layout
         );

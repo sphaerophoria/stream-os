@@ -2,14 +2,13 @@ macro_rules! print {
     ($($arg:tt)*) => {
         #[allow(unused_unsafe)]
         unsafe {
-            let mut sinks = crate::io::STDOUT_SINKS.borrow_mut();
-            use core::fmt::Write as FmtWrite;
-            if let Some(vga) = &mut sinks.vga {
-                write!(vga, $($arg)*).expect("Failed to print to vga");
-            }
-
-            if let Some(serial) = &mut sinks.serial {
-                write!(serial, $($arg)*).expect("Failed to print to serial");
+            let printer = &mut *crate::io::PRINTER.inner.get();
+            if let Some(printer) = printer.as_mut() {
+                if let Some(s) = format_args!($($arg)*).as_str() {
+                    printer(s).await;
+                } else {
+                    printer(&alloc::format!($($arg)*)).await;
+                }
             }
         }
     }

@@ -1,5 +1,6 @@
 use crate::util::{circular_array::CircularArray, interrupt_guard::InterruptGuarded};
 use alloc::{borrow::Cow, string::String};
+use core::future::Future;
 use hashbrown::HashMap;
 
 #[allow(unused)]
@@ -137,9 +138,18 @@ impl Logger {
         }
     }
 
-    pub fn service(&self) {
-        while let Some(v) = self.logs.lock().pop_front() {
-            println!("{}", v);
+    pub async fn service<F, Fut>(&self, sleep: F)
+    where
+        Fut: Future<Output = ()>,
+        F: Fn(f32) -> Fut,
+    {
+        loop {
+            // FIXME: Proper signaling of logs ready
+            while let Some(v) = self.logs.lock().pop_front() {
+                println!("{}", v);
+            }
+
+            sleep(0.06).await;
         }
     }
 }
@@ -148,6 +158,10 @@ pub fn init(log_levels: HashMap<String, LogLevel>) {
     *LOGGER.levels.lock() = Some(log_levels);
 }
 
-pub fn service() {
-    LOGGER.service()
+pub async fn service<F, Fut>(sleep: F)
+where
+    Fut: Future<Output = ()>,
+    F: Fn(f32) -> Fut,
+{
+    LOGGER.service(sleep).await;
 }

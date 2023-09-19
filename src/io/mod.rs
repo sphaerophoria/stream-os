@@ -1,9 +1,14 @@
-use core::cell::RefCell;
+use alloc::{boxed::Box};
+use core::{
+    cell::{RefCell, UnsafeCell},
+    future::Future,
+    pin::Pin,
+};
 use port_manager::{Port, PortManager};
-use serial::Serial;
-use vga::TerminalWriter;
 
-use crate::interrupts::InterruptHandlerData;
+
+
+
 
 #[macro_use]
 pub mod vga;
@@ -11,38 +16,24 @@ pub mod port_manager;
 pub mod rtc;
 pub mod serial;
 
-pub struct StdoutSinksInner {
-    pub vga: Option<TerminalWriter>,
-    pub serial: Option<Serial>,
+pub type PrinterFunction = dyn FnMut(&'_ str) -> Pin<Box<dyn '_ + Future<Output = ()>>>;
+
+pub struct Printer {
+    #[allow(clippy::type_complexity)]
+    pub inner: UnsafeCell<Option<Box<PrinterFunction>>>,
 }
 
-pub struct StdoutSinks {
-    inner: RefCell<StdoutSinksInner>,
-}
-
-impl core::ops::Deref for StdoutSinks {
-    type Target = RefCell<StdoutSinksInner>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl StdoutSinks {
-    const fn new() -> StdoutSinks {
-        StdoutSinks {
-            inner: RefCell::new(StdoutSinksInner {
-                vga: None,
-                serial: None,
-            }),
+impl Printer {
+    const fn new() -> Printer {
+        Printer {
+            inner: UnsafeCell::new(None),
         }
     }
 }
 
-// RefCell is not sync, but we only have one thread...
-unsafe impl Sync for StdoutSinks {}
-
-pub static STDOUT_SINKS: StdoutSinks = StdoutSinks::new();
+// Single threaded
+unsafe impl Sync for Printer {}
+pub static PRINTER: Printer = Printer::new();
 
 struct ExitPort {
     port: RefCell<Option<Port>>,
@@ -60,15 +51,9 @@ unsafe impl Sync for ExitPort {}
 
 static EXIT_PORT: ExitPort = ExitPort::new();
 
-pub fn init_stdio(port_manager: &mut PortManager, interrupt_handlers: &InterruptHandlerData) {
-    let mut sinks = STDOUT_SINKS.borrow_mut();
-    sinks.vga = Some(TerminalWriter::new());
-    sinks.serial = match Serial::new(port_manager, interrupt_handlers) {
-        Ok(v) => Some(v),
-        Err(e) => {
-            error!("Failed to initialize serial output: {}", e);
-            None
-        }
+pub fn init_stdio(print_fn: Box<PrinterFunction>) {
+    unsafe {
+        *PRINTER.inner.get() = Some(print_fn);
     }
 }
 

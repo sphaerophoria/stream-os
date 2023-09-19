@@ -31,13 +31,18 @@ mod sleep;
 mod time;
 mod util;
 
-use alloc::{sync::Arc, vec};
+use alloc::{boxed::Box, rc::Rc, vec};
+use interrupts::InterruptHandlerData;
+use io::{port_manager::PortManager, vga::TerminalWriter};
 use multiboot::MultibootInfo;
 
-use core::{arch::global_asm, panic::PanicInfo};
+use core::{arch::global_asm, cell::RefCell, fmt::Write, panic::PanicInfo};
 
 use crate::{
-    future::execute_fut, io::rtc::Rtc, sleep::WakeupList, time::MonotonicTime,
+    future::execute_fut,
+    io::{rtc::Rtc, serial::Serial, PrinterFunction},
+    sleep::WakeupList,
+    time::MonotonicTime,
     util::interrupt_guard::InterruptGuarded,
 };
 
@@ -51,6 +56,87 @@ extern "C" {
     static KERNEL_END: u32;
 }
 
+async unsafe fn async_main(
+    port_manager: &mut PortManager,
+    interrupt_handlers: &InterruptHandlerData,
+) {
+    let serial = Rc::new(RefCell::new(
+        Serial::new(port_manager, interrupt_handlers).expect("Failed to initialize serial"),
+    ));
+
+    let terminal_writer = Rc::new(RefCell::new(TerminalWriter::new()));
+
+    let printer_function: Box<PrinterFunction> = Box::new(move |s| {
+        let serial = Rc::clone(&serial);
+        let terminal_writer = Rc::clone(&terminal_writer);
+        alloc::boxed::Box::pin(async move {
+            terminal_writer
+                .borrow_mut()
+                .write_str(s)
+                .expect("Failed to write to terminal");
+            serial.borrow_mut().write_str(s).await;
+        })
+    });
+
+    io::init_stdio(printer_function);
+    io::init_late(port_manager);
+
+    #[cfg(test)]
+    {
+        test_main();
+        io::exit(0);
+    }
+
+    let monotonic_time = Rc::new(MonotonicTime::new(Rtc::tick_freq()));
+    let wakeup_list = Rc::new(WakeupList::new());
+    let on_tick = {
+        let monotonic_time = Rc::clone(&monotonic_time);
+        let wakeup_list = Rc::clone(&wakeup_list);
+
+        move || {
+            let tick = monotonic_time.increment();
+            wakeup_list.wakeup_if_neccessary(tick);
+        }
+    };
+
+    let sleep = {
+        let monotonic_time = Rc::clone(&monotonic_time);
+        let wakeup_list = Rc::clone(&wakeup_list);
+        move |t| {
+            let monotonic_time = Rc::clone(&monotonic_time);
+            let wakeup_list = Rc::clone(&wakeup_list);
+            Box::pin(async move { sleep::sleep(t, &monotonic_time, &wakeup_list).await })
+        }
+    };
+
+    let demo = async move {
+        let mut rtc = io::rtc::Rtc::new(port_manager, interrupt_handlers, on_tick)
+            .expect("Failed to construct rtc");
+
+        info!("A vector: {:?}", vec![1, 2, 3, 4, 5]);
+        let a_map: hashbrown::HashMap<&'static str, i32> =
+            [("test", 1), ("test2", 2)].into_iter().collect();
+        info!("A map: {:?}", a_map);
+
+        let mut date = rtc.read();
+        info!("Current date: {:?}", date);
+        date.hours -= 1;
+        rtc.write(&date);
+        let date = rtc.read();
+        info!("Current date modified in cmos: {:?}", date);
+        info!("Sleep for 3 seconds");
+
+        sleep::sleep(3.0, &monotonic_time, &wakeup_list).await;
+
+        info!("And now we exit/halt");
+
+        // FIXME: Sleep for a little longer to give the logger time to print the last message
+        sleep::sleep(0.1, &monotonic_time, &wakeup_list).await;
+    };
+
+    futures::future::select(Box::pin(logger::service(sleep)), Box::pin(demo)).await;
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const MultibootInfo) -> i32 {
     // Disable interrupts until interrupts are initialized
@@ -60,55 +146,13 @@ pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const Multibo
     allocator::init(&*info);
     logger::init(Default::default());
 
-    let mut port_manager = io::port_manager::PortManager::new();
-
     gdt::init();
 
+    let mut port_manager = io::port_manager::PortManager::new();
     let interrupt_handlers = interrupts::init(&mut port_manager);
     drop(interrupt_guard);
 
-    io::init_stdio(&mut port_manager, interrupt_handlers);
-    io::init_late(&mut port_manager);
-
-    #[cfg(test)]
-    {
-        test_main();
-        io::exit(0);
-    }
-
-    info!("A vector: {:?}", vec![1, 2, 3, 4, 5]);
-    let a_map: hashbrown::HashMap<&'static str, i32> =
-        [("test", 1), ("test2", 2)].into_iter().collect();
-    info!("A map: {:?}", a_map);
-
-    let monotonic_time = Arc::new(MonotonicTime::new(Rtc::tick_freq()));
-    let wakeup_list = Arc::new(WakeupList::new());
-    let on_tick = {
-        let monotonic_time = Arc::clone(&monotonic_time);
-        let wakeup_list = Arc::clone(&wakeup_list);
-
-        move || {
-            let tick = monotonic_time.increment();
-            wakeup_list.wakeup_if_neccessary(tick);
-        }
-    };
-
-    let mut rtc = io::rtc::Rtc::new(&mut port_manager, interrupt_handlers, on_tick)
-        .expect("Failed to construct rtc");
-    let mut date = rtc.read();
-    info!("Current date: {:?}", date);
-    date.hours -= 1;
-    rtc.write(&date);
-    let date = rtc.read();
-    info!("Current date modified in cmos: {:?}", date);
-    info!("Sleep for 3 seconds");
-    logger::service();
-
-    let fut = sleep::sleep(3.0, &monotonic_time, &wakeup_list);
-    execute_fut(fut);
-
-    info!("And now we exit/halt");
-    logger::service();
+    execute_fut(async_main(&mut port_manager, interrupt_handlers));
 
     io::exit(0);
     0
@@ -118,9 +162,13 @@ pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const Multibo
 #[panic_handler]
 fn panic(panic_info: &PanicInfo) -> ! {
     if let Some(args) = panic_info.message() {
-        println!("{}", args);
+        execute_fut(async {
+            println!("{}", args);
+        });
     } else {
-        println!("Paniced!");
+        execute_fut(async {
+            println!("Paniced!");
+        });
     }
 
     unsafe {

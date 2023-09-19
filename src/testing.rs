@@ -1,19 +1,26 @@
-use alloc::string::String;
+use crate::future;
+
+use core::{future::Future, pin::Pin};
+
+use alloc::{boxed::Box, string::String};
 
 pub struct TestCase {
     pub name: &'static str,
-    pub test: &'static (dyn Fn() -> Result<(), String> + Send + Sync),
+    pub test:
+        &'static (dyn Send + Sync + Fn() -> Pin<Box<dyn Future<Output = Result<(), String>>>>),
 }
 
 pub fn test_runner(test_fns: &[&TestCase]) {
-    for test_case in test_fns {
-        print!("{}... ", test_case.name);
-        if let Err(e) = (test_case.test)() {
-            println!("{}", e);
-        } else {
-            println!("[ok]");
+    future::execute_fut(async {
+        for test_case in test_fns {
+            print!("{}... ", test_case.name);
+            if let Err(e) = (test_case.test)().await {
+                println!("{}", e);
+            } else {
+                println!("[ok]");
+            }
         }
-    }
+    });
 }
 
 macro_rules! create_test {
@@ -24,8 +31,10 @@ macro_rules! create_test {
                 name: concat!(file!(), " ", stringify!($name)),
                 test: &[<$name _test>],
             };
-            fn [<$name _test>]() -> Result<(), alloc::string::String> {
-                $content
+            fn [<$name _test>]() -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output=Result<(), alloc::string::String>>>> {
+                alloc::boxed::Box::pin(async {
+                    $content
+                })
             }
         }
     };
