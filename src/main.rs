@@ -64,10 +64,6 @@ struct EarlyInitHandles {
 }
 
 unsafe fn early_init(info: *const MultibootInfo) -> EarlyInitHandles {
-    // Disable interrupts until interrupts are initialized
-    let interrupt_guard = InterruptGuarded::new(());
-    let interrupt_guard = interrupt_guard.lock();
-
     allocator::init(&*info);
     logger::init(Default::default());
 
@@ -75,7 +71,6 @@ unsafe fn early_init(info: *const MultibootInfo) -> EarlyInitHandles {
 
     let mut port_manager = io::port_manager::PortManager::new();
     let interrupt_handlers = interrupts::init(&mut port_manager);
-    drop(interrupt_guard);
 
     let monotonic_time = Rc::new(MonotonicTime::new(Rtc::tick_freq()));
     let wakeup_list = Rc::new(WakeupList::new());
@@ -85,6 +80,24 @@ unsafe fn early_init(info: *const MultibootInfo) -> EarlyInitHandles {
         monotonic_time,
         wakeup_list,
     }
+}
+
+#[allow(clippy::await_holding_refcell_ref)]
+fn gen_printers(
+    serial: Rc<RefCell<Serial>>,
+    terminal_writer: Rc<RefCell<TerminalWriter>>,
+) -> Box<PrinterFunction> {
+    Box::new(move |s| {
+        let serial = Rc::clone(&serial);
+        let terminal_writer = Rc::clone(&terminal_writer);
+        alloc::boxed::Box::pin(async move {
+            terminal_writer
+                .borrow_mut()
+                .write_str(s)
+                .expect("Failed to write to terminal");
+            serial.borrow_mut().write_str(s).await;
+        })
+    })
 }
 
 #[allow(unused)]
@@ -112,21 +125,7 @@ impl Kernel {
 
         let terminal_writer = Rc::new(RefCell::new(TerminalWriter::new()));
 
-        let printer_function: Box<PrinterFunction> = Box::new({
-            let serial = Rc::clone(&serial);
-            let terminal_writer = Rc::clone(&terminal_writer);
-            move |s| {
-                let serial = Rc::clone(&serial);
-                let terminal_writer = Rc::clone(&terminal_writer);
-                alloc::boxed::Box::pin(async move {
-                    terminal_writer
-                        .borrow_mut()
-                        .write_str(s)
-                        .expect("Failed to write to terminal");
-                    serial.borrow_mut().write_str(s).await;
-                })
-            }
-        });
+        let printer_function = gen_printers(Rc::clone(&serial), Rc::clone(&terminal_writer));
 
         io::init_stdio(printer_function);
         io::init_late(&mut port_manager);
