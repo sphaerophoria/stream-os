@@ -1,14 +1,10 @@
-use alloc::{boxed::Box};
+use alloc::boxed::Box;
 use core::{
     cell::{RefCell, UnsafeCell},
     future::Future,
     pin::Pin,
 };
 use port_manager::{Port, PortManager};
-
-
-
-
 
 #[macro_use]
 pub mod vga;
