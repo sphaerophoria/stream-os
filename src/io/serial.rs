@@ -2,146 +2,122 @@ use core::task::Poll;
 
 use crate::{
     future::wakeup_executor,
-    interrupts::{InterruptHandlerData, IrqId},
-    io::port_manager::{Port, PortManager},
+    interrupts::{InterruptHandlerData, InterruptHandlerRegisterError, IrqId},
+    io::io_allocator::{IoAllocator, IoOffset, IoRange, OffsetOutOfRange},
 };
 
-use thiserror_no_std::Error;
-
 const BASE_ADDR: u16 = 0x3f8;
+const DATA_OFFSET: IoOffset = IoOffset::new(0);
+const ENABLE_INTERRUPT_OFFSET: IoOffset = IoOffset::new(1);
+const INTERRUPT_ID_FIFO_CONTROL_OFFSET: IoOffset = IoOffset::new(2);
+const LINE_CONTROL_OFFSET: IoOffset = IoOffset::new(3);
+const MODEM_CONTROL_OFFSET: IoOffset = IoOffset::new(4);
+const LINE_STATUS_OFFSET: IoOffset = IoOffset::new(5);
+const _MODEM_STATUS_OFFSET: IoOffset = IoOffset::new(6);
+const _SCRATCH_OFFSET: IoOffset = IoOffset::new(7);
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum SerialInitError {
-    #[error("data port reserved")]
-    DataReserved,
-    #[error("enable interrupt port reserved")]
-    EnableInterruptReserved,
-    #[error("interrupt id port reserved")]
-    InterruptIdReserved,
-    #[error("line control port reserved")]
-    LineControlReserved,
-    #[error("modem control port reserved")]
-    ModemControlReserved,
-    #[error("line status port reserved")]
-    LineStatusReserved,
-    #[error("modem status port reserved")]
-    ModemStatusReserved,
-    #[error("scratch port reserved")]
-    ScratchReserved,
-    #[error("loopback test failed")]
+    IoRangeReserved,
+    RegisterInterrupt(InterruptHandlerRegisterError),
+    WriteFailed(OffsetOutOfRange),
     Loopback,
 }
 
+#[derive(Debug)]
+pub struct WriteError(OffsetOutOfRange);
+
 pub struct Serial {
-    data: Port,
-    _enable_interrupt: Port,
-    _interrupt_id_fifo_control: Port,
-    _line_control: Port,
-    _modem_control: Port,
-    line_status: Port,
-    _modem_status: Port,
-    _scratch: Port,
+    serial_io: IoRange,
 }
 
 impl Serial {
     pub fn new(
-        port_manager: &mut PortManager,
+        io_allocator: &mut IoAllocator,
         interrupt_handlers: &InterruptHandlerData,
     ) -> Result<Serial, SerialInitError> {
         use SerialInitError::*;
 
-        let mut data = port_manager.request_port(BASE_ADDR).ok_or(DataReserved)?;
-        let mut enable_interrupt = port_manager
-            .request_port(BASE_ADDR + 1)
-            .ok_or(EnableInterruptReserved)?;
-        let mut interrupt_id_fifo_control = port_manager
-            .request_port(BASE_ADDR + 2)
-            .ok_or(InterruptIdReserved)?;
-        let mut line_control = port_manager
-            .request_port(BASE_ADDR + 3)
-            .ok_or(LineControlReserved)?;
-        let mut modem_control = port_manager
-            .request_port(BASE_ADDR + 4)
-            .ok_or(ModemControlReserved)?;
-        let line_status = port_manager
-            .request_port(BASE_ADDR + 5)
-            .ok_or(LineStatusReserved)?;
-        let modem_status = port_manager
-            .request_port(BASE_ADDR + 6)
-            .ok_or(ModemStatusReserved)?;
-        let scratch = port_manager
-            .request_port(BASE_ADDR + 7)
-            .ok_or(ScratchReserved)?;
+        let mut serial_io = io_allocator
+            .request_io_range(BASE_ADDR, 8)
+            .ok_or(IoRangeReserved)?;
 
-        interrupt_handlers.register(IrqId::Pic1(4), {
-            move || {
-                wakeup_executor();
-            }
-        });
+        interrupt_handlers
+            .register(IrqId::Pic1(4), {
+                move || {
+                    wakeup_executor();
+                }
+            })
+            .map_err(RegisterInterrupt)?;
 
-        enable_interrupt.writeb(0x02); // Enable transmit empty
-        line_control.writeb(0x80); // Enable DLAB (set baud rate divisor)
-        data.writeb(0x00);
-        enable_interrupt.writeb(0x02);
-        line_control.writeb(0x03); // 8 bits, no parity, one stop bit
-        interrupt_id_fifo_control.writeb(0xC7); // Enable FIFO, clear them, with 14-byte threshold
-        modem_control.writeb(0x0B); // IRQs enabled, RTS/DSR set
-        modem_control.writeb(0x1E); // Set in loopback mode, test the serial chip
-        data.writeb(0xAE); // Test serial chip (send byte 0xAE and check if serial returns same byte)
+        (|| -> Result<(), OffsetOutOfRange> {
+            serial_io.write_u8(ENABLE_INTERRUPT_OFFSET, 0x02)?; // Enable transmit empty
+            serial_io.write_u8(LINE_CONTROL_OFFSET, 0x80)?; // Enable DLAB (set baud rate divisor)
+            serial_io.write_u8(DATA_OFFSET, 0x00)?;
+            serial_io.write_u8(ENABLE_INTERRUPT_OFFSET, 0x02)?;
+            serial_io.write_u8(LINE_CONTROL_OFFSET, 0x03)?; // 8 bits, no parity, one stop bit
+            serial_io.write_u8(INTERRUPT_ID_FIFO_CONTROL_OFFSET, 0xC7)?; // Enable FIFO, clear them, with 14-byte threshold
+            serial_io.write_u8(MODEM_CONTROL_OFFSET, 0x0B)?; // IRQs enabled, RTS/DSR set
+            serial_io.write_u8(MODEM_CONTROL_OFFSET, 0x1E)?; // Set in loopback mode, test the serial chip
+            serial_io.write_u8(DATA_OFFSET, 0xAE)?; // Test serial chip (send byte 0xAE and check if serial returns same byte)
+            Ok(())
+        })()
+        .map_err(WriteFailed)?;
 
         // Check if serial is faulty (i.e: not same byte as sent)
-        if data.readb() != 0xAE {
+        if serial_io.read_u8(DATA_OFFSET).map_err(WriteFailed)? != 0xAE {
             return Err(Loopback);
         }
 
         // If serial is not faulty set it in normal operation mode
         // (not-loopback with IRQs enabled and OUT#1 and OUT#2 bits enabled)
-        modem_control.writeb(0x0F);
-
-        Ok(Serial {
-            data,
-            _enable_interrupt: enable_interrupt,
-            _interrupt_id_fifo_control: interrupt_id_fifo_control,
-            _line_control: line_control,
-            _modem_control: modem_control,
-            line_status,
-            _modem_status: modem_status,
-            _scratch: scratch,
-        })
+        serial_io
+            .write_u8(MODEM_CONTROL_OFFSET, 0x0F)
+            .map_err(WriteFailed)?;
+        Ok(Serial { serial_io })
     }
 
     #[allow(unused)]
     async fn wait_transmit_empty(&mut self) {
-        if is_transmit_ready(&mut self.line_status) {
+        if is_transmit_ready(&mut self.serial_io) {
             return;
         }
         let waiter = TransmitEmptyWaiter {
-            line_status: &mut self.line_status,
+            serial_io: &mut self.serial_io,
         };
         waiter.await;
     }
 
-    fn write_byte(&mut self, a: u8) {
-        while !is_transmit_ready(&mut self.line_status) {}
+    fn write_byte(&mut self, a: u8) -> Result<(), WriteError> {
+        while !is_transmit_ready(&mut self.serial_io) {}
 
-        self.data.writeb(a);
+        self.serial_io
+            .write_u8(DATA_OFFSET, a)
+            .map_err(WriteError)?;
+
+        Ok(())
     }
 
-    #[allow(unused)]
-    pub async fn write_str(&mut self, s: &str) {
+    pub async fn write_str(&mut self, s: &str) -> Result<(), WriteError> {
         for b in s.as_bytes() {
             self.wait_transmit_empty().await;
-            self.write_byte(*b);
+            self.write_byte(*b)?;
         }
+
+        Ok(())
     }
 }
 
-fn is_transmit_ready(line_status: &mut Port) -> bool {
-    (line_status.readb() & 0x20) != 0
+fn is_transmit_ready(serial_io: &mut IoRange) -> bool {
+    (serial_io
+        .read_u8(LINE_STATUS_OFFSET)
+        .expect("line status not allocated")
+        & 0x20)
+        != 0
 }
 
 struct TransmitEmptyWaiter<'a> {
-    line_status: &'a mut Port,
+    serial_io: &'a mut IoRange,
 }
 
 impl core::future::Future for TransmitEmptyWaiter<'_> {
@@ -151,7 +127,7 @@ impl core::future::Future for TransmitEmptyWaiter<'_> {
         mut self: core::pin::Pin<&mut Self>,
         _cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
-        if is_transmit_ready(self.line_status) {
+        if is_transmit_ready(self.serial_io) {
             return Poll::Ready(());
         }
 
@@ -162,7 +138,7 @@ impl core::future::Future for TransmitEmptyWaiter<'_> {
 impl core::fmt::Write for Serial {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for b in s.as_bytes() {
-            self.write_byte(*b)
+            self.write_byte(*b).expect("failed to write to serial");
         }
         Ok(())
     }

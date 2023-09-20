@@ -1,6 +1,6 @@
 pub trait GetBits {
     fn get_bits(&self, shift: Self, length: Self) -> Self;
-    fn get_bit(&self, shift: Self) -> Self;
+    fn get_bit(&self, shift: Self) -> bool;
 }
 
 pub trait SetBits {
@@ -39,8 +39,8 @@ macro_rules! impl_get_bits {
                 (*self >> shift) & mask
             }
 
-            fn get_bit(&self, shift: Self) -> Self {
-                self.get_bits(shift, 1)
+            fn get_bit(&self, shift: Self) -> bool {
+                self.get_bits(shift, 1) == 1
             }
         }
     };
@@ -86,15 +86,15 @@ mod test {
 
     create_test!(test_get_bits, {
         let val = 0x12345678u32;
-        test_eq!(val.get_bit(3), 1);
-        test_eq!(val.get_bit(2), 0);
-        test_eq!(val.get_bit(1), 0);
-        test_eq!(val.get_bit(0), 0);
+        test_eq!(val.get_bit(3), true);
+        test_eq!(val.get_bit(2), false);
+        test_eq!(val.get_bit(1), false);
+        test_eq!(val.get_bit(0), false);
 
-        test_eq!(val.get_bit(31), 0);
-        test_eq!(val.get_bit(30), 0);
-        test_eq!(val.get_bit(29), 0);
-        test_eq!(val.get_bit(28), 1);
+        test_eq!(val.get_bit(31), false);
+        test_eq!(val.get_bit(30), false);
+        test_eq!(val.get_bit(29), false);
+        test_eq!(val.get_bit(28), true);
 
         test_eq!(val.get_bits(28, 4), 0x1);
         test_eq!(val.get_bits(24, 4), 0x2);

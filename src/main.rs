@@ -32,18 +32,25 @@ mod time;
 mod util;
 
 use alloc::{boxed::Box, rc::Rc, vec};
-use interrupts::InterruptHandlerData;
-use io::{port_manager::PortManager, vga::TerminalWriter};
-use multiboot::MultibootInfo;
+use io::io_allocator::IoOffset;
 
 use core::{arch::global_asm, cell::RefCell, fmt::Write, panic::PanicInfo};
 
 use crate::{
     future::execute_fut,
-    io::{rtc::Rtc, serial::Serial, PrinterFunction},
+    interrupts::{InitInterruptError, InterruptHandlerData},
+    io::{
+        io_allocator::IoAllocator,
+        pci::{Pci, PciDevice},
+        rtc::Rtc,
+        serial::Serial,
+        vga::TerminalWriter,
+        PrinterFunction,
+    },
+    multiboot::MultibootInfo,
     sleep::WakeupList,
     time::MonotonicTime,
-    util::interrupt_guard::InterruptGuarded,
+    util::{bit_manipulation::GetBits, interrupt_guard::InterruptGuarded},
 };
 
 // Include boot.s which defines _start as inline assembly in main. This allows us to do more fine
@@ -57,29 +64,29 @@ extern "C" {
 }
 
 struct EarlyInitHandles {
-    port_manager: PortManager,
+    io_allocator: IoAllocator,
     interrupt_handlers: &'static InterruptHandlerData,
     monotonic_time: Rc<MonotonicTime>,
     wakeup_list: Rc<WakeupList>,
 }
 
-unsafe fn early_init(info: *const MultibootInfo) -> EarlyInitHandles {
+unsafe fn early_init(info: *const MultibootInfo) -> Result<EarlyInitHandles, InitInterruptError> {
     allocator::init(&*info);
     logger::init(Default::default());
 
     gdt::init();
 
-    let mut port_manager = io::port_manager::PortManager::new();
-    let interrupt_handlers = interrupts::init(&mut port_manager);
+    let mut io_allocator = io::io_allocator::IoAllocator::new();
+    let interrupt_handlers = interrupts::init(&mut io_allocator)?;
 
     let monotonic_time = Rc::new(MonotonicTime::new(Rtc::tick_freq()));
     let wakeup_list = Rc::new(WakeupList::new());
-    EarlyInitHandles {
-        port_manager,
+    Ok(EarlyInitHandles {
+        io_allocator,
         interrupt_handlers,
         monotonic_time,
         wakeup_list,
-    }
+    })
 }
 
 #[allow(clippy::await_holding_refcell_ref)]
@@ -95,16 +102,21 @@ fn gen_printers(
                 .borrow_mut()
                 .write_str(s)
                 .expect("Failed to write to terminal");
-            serial.borrow_mut().write_str(s).await;
+            serial
+                .borrow_mut()
+                .write_str(s)
+                .await
+                .expect("failed to write to terminal");
         })
     })
 }
 
 #[allow(unused)]
 struct Kernel {
-    port_manager: PortManager,
+    io_allocator: IoAllocator,
     interrupt_handlers: &'static InterruptHandlerData,
     rtc: Rtc,
+    pci: Pci,
     serial: Rc<RefCell<Serial>>,
     terminal_writer: Rc<RefCell<TerminalWriter>>,
     monotonic_time: Rc<MonotonicTime>,
@@ -113,13 +125,13 @@ struct Kernel {
 
 impl Kernel {
     async unsafe fn init(early_handles: EarlyInitHandles) -> Kernel {
-        let mut port_manager = early_handles.port_manager;
+        let mut io_allocator = early_handles.io_allocator;
         let interrupt_handlers = early_handles.interrupt_handlers;
         let wakeup_list = early_handles.wakeup_list;
         let monotonic_time = early_handles.monotonic_time;
 
         let serial = Rc::new(RefCell::new(
-            Serial::new(&mut port_manager, interrupt_handlers)
+            Serial::new(&mut io_allocator, interrupt_handlers)
                 .expect("Failed to initialize serial"),
         ));
 
@@ -128,7 +140,7 @@ impl Kernel {
         let printer_function = gen_printers(Rc::clone(&serial), Rc::clone(&terminal_writer));
 
         io::init_stdio(printer_function);
-        io::init_late(&mut port_manager);
+        io::init_late(&mut io_allocator);
 
         let on_tick = {
             let monotonic_time = Rc::clone(&monotonic_time);
@@ -140,13 +152,16 @@ impl Kernel {
             }
         };
 
-        let rtc = io::rtc::Rtc::new(&mut port_manager, interrupt_handlers, on_tick)
+        let rtc = io::rtc::Rtc::new(&mut io_allocator, interrupt_handlers, on_tick)
             .expect("Failed to construct rtc");
+
+        let pci = Pci::new(&mut io_allocator).expect("Failed to initialize pci");
 
         Kernel {
             interrupt_handlers,
-            port_manager,
+            io_allocator,
             rtc,
+            pci,
             serial,
             terminal_writer,
             monotonic_time,
@@ -154,18 +169,45 @@ impl Kernel {
         }
     }
 
-    async fn demo(&mut self) {
+    async unsafe fn demo(&mut self) {
         info!("A vector: {:?}", vec![1, 2, 3, 4, 5]);
         let a_map: hashbrown::HashMap<&'static str, i32> =
             [("test", 1), ("test2", 2)].into_iter().collect();
         info!("A map: {:?}", a_map);
 
-        let mut date = self.rtc.read();
+        let mut date = self.rtc.read().expect("failed to read date");
         info!("Current date: {:?}", date);
         date.hours -= 1;
-        self.rtc.write(&date);
-        let date = self.rtc.read();
+        self.rtc.write(&date).expect("failed to write rtc date");
+
+        let date = self.rtc.read().expect("failed to read date");
         info!("Current date modified in cmos: {:?}", date);
+
+        let rtl_device = match self.pci.find_device(0x10ec, 0x8139).unwrap().unwrap() {
+            PciDevice::General(v) => v,
+            _ => panic!("RTL device not general as expected"),
+        };
+        let io_base = rtl_device.find_io_base(&mut self.pci).unwrap();
+        assert!(io_base <= u16::MAX as u32);
+        let mut rtl_io = self
+            .io_allocator
+            .request_io_range(io_base as u16, 8)
+            .unwrap();
+        let mut mac = alloc::vec::Vec::new();
+        let first_4 = rtl_io.read_32(IoOffset::new(0)).unwrap();
+        mac.push(first_4.get_bits(0, 8));
+        mac.push(first_4.get_bits(8, 8));
+        mac.push(first_4.get_bits(16, 8));
+        mac.push(first_4.get_bits(24, 8));
+        let second_4 = rtl_io.read_32(IoOffset::new(4)).unwrap();
+        mac.push(second_4.get_bits(0, 8));
+        mac.push(second_4.get_bits(8, 8));
+        println!("Mac address received through io space: {:x?}", mac);
+
+        let memory_base = rtl_device.find_mmap_base(&mut self.pci).unwrap() as *const u8;
+        let mac = core::slice::from_raw_parts(memory_base, 6);
+        println!("Mac address received through memory space: {:x?}", mac);
+
         info!("Sleep for 3 seconds");
 
         sleep::sleep(3.0, &self.monotonic_time, &self.wakeup_list).await;
@@ -214,7 +256,7 @@ pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const Multibo
         early_init(info)
     };
 
-    execute_fut(async_main(early_handles));
+    execute_fut(async_main(early_handles.unwrap()));
 
     io::exit(0);
     0

@@ -107,3 +107,24 @@ macro_rules! test_false {
         }
     };
 }
+
+macro_rules! test_ok {
+    ($a:expr) => {
+        if $a.is_err() {
+            return Err(alloc::format!("{}:{} {:?} is not ok", file!(), line!(), $a));
+        }
+    };
+}
+
+macro_rules! test_err {
+    ($a:expr) => {
+        if $a.is_ok() {
+            return Err(alloc::format!(
+                "{}:{} {:?} is not err",
+                file!(),
+                line!(),
+                $a
+            ));
+        }
+    };
+}

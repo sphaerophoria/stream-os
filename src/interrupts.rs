@@ -1,5 +1,5 @@
 use crate::{
-    io::port_manager::{Port, PortManager},
+    io::io_allocator::{IoAllocator, IoOffset, IoRange, OffsetOutOfRange},
     util::bit_manipulation::SetBits,
     util::interrupt_guard::InterruptGuarded,
 };
@@ -10,6 +10,9 @@ use hashbrown::HashMap;
 static INTERRUPT_TABLE: InterruptTable = InterruptTable::new();
 static INTERRUPT_HANDLER_DATA: InterruptHandlerData = InterruptHandlerData::new();
 static ISRS: InterruptGuarded<[[u8; 21]; 255]> = InterruptGuarded::new([[0; 21]; 255]);
+
+const PIC_COMMAND_OFFSET: IoOffset = IoOffset::new(0);
+const PIC_DATA_OFFSET: IoOffset = IoOffset::new(1);
 
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
@@ -100,35 +103,85 @@ fn generate_interrupt_stub(num: u8) -> [u8; 21] {
     ret
 }
 
+#[derive(Debug)]
+pub enum InterruptHandlerError {
+    NotInitialized,
+    Pic1Eoi(OffsetOutOfRange),
+    Pic2Eoi(OffsetOutOfRange),
+}
+
+#[derive(Debug)]
+pub enum InterruptHandlerRegisterError {
+    NotInitialized,
+    ReadPic1(OffsetOutOfRange),
+    ReadPic2(OffsetOutOfRange),
+    WritePic1(OffsetOutOfRange),
+    WritePic2(OffsetOutOfRange),
+}
+
+#[derive(Debug)]
+pub struct PicRemapError(OffsetOutOfRange);
+
+#[derive(Debug)]
+pub struct DisableInterruptError(OffsetOutOfRange);
+
+#[derive(Debug)]
+pub enum InitInterruptError {
+    AcquirePic1,
+    AcquirePic2,
+    RemapPic(PicRemapError),
+    DisableInterrupts(DisableInterruptError),
+}
 
 #[no_mangle]
 extern "C" fn generic_interrupt_handler(interrupt_number: u8) {
-    let handlers = INTERRUPT_HANDLER_DATA.handlers.lock();
-    let f = match handlers
-        .as_ref()
-        .expect("interrupt handlers not initialized")
-        .get(&interrupt_number)
-    {
-        Some(f) => f,
-        None => {
-            panic!("no handler for interrupt {}", interrupt_number);
+    let ret = (|| -> Result<(), InterruptHandlerError> {
+        let handlers = INTERRUPT_HANDLER_DATA.handlers.lock();
+        let f = match handlers
+            .as_ref()
+            .ok_or(InterruptHandlerError::NotInitialized)?
+            .get(&interrupt_number)
+        {
+            Some(f) => f,
+            None => {
+                panic!("no handler for interrupt {}", interrupt_number);
+            }
+        };
+        f();
+
+        const END_OF_INTERRUPT: u8 = 0x20;
+
+        if (PIC2_OFFSET..PIC2_OFFSET + 8).contains(&interrupt_number) {
+            let mut pic_io = INTERRUPT_HANDLER_DATA.pic_io.lock();
+            let pic_io = pic_io
+                .as_mut()
+                .ok_or(InterruptHandlerError::NotInitialized)?;
+            pic_io
+                .pic2_io
+                .write_u8(PIC_COMMAND_OFFSET, END_OF_INTERRUPT)
+                .map_err(InterruptHandlerError::Pic2Eoi)?;
+            pic_io
+                .pic1_io
+                .write_u8(PIC_COMMAND_OFFSET, END_OF_INTERRUPT)
+                .map_err(InterruptHandlerError::Pic1Eoi)?;
         }
-    };
-    f();
 
-    const END_OF_INTERRUPT: u8 = 0x20;
+        if (PIC1_OFFSET..PIC1_OFFSET + 8).contains(&interrupt_number) {
+            let mut pic_io = INTERRUPT_HANDLER_DATA.pic_io.lock();
+            let pic_io = pic_io
+                .as_mut()
+                .ok_or(InterruptHandlerError::NotInitialized)?;
+            pic_io
+                .pic1_io
+                .write_u8(PIC_COMMAND_OFFSET, END_OF_INTERRUPT)
+                .map_err(InterruptHandlerError::Pic1Eoi)?;
+        }
 
-    if (PIC2_OFFSET..PIC2_OFFSET + 8).contains(&interrupt_number) {
-        let mut ports = INTERRUPT_HANDLER_DATA.ports.lock();
-        let ports = ports.as_mut().expect("interrupt handlers not initialized");
-        ports.pic2_command.writeb(END_OF_INTERRUPT);
-        ports.pic1_command.writeb(END_OF_INTERRUPT);
-    }
+        Ok(())
+    })();
 
-    if (PIC1_OFFSET..PIC1_OFFSET + 8).contains(&interrupt_number) {
-        let mut ports = INTERRUPT_HANDLER_DATA.ports.lock();
-        let ports = ports.as_mut().expect("interrupt handlers not initialized");
-        ports.pic1_command.writeb(END_OF_INTERRUPT);
+    if let Err(e) = ret {
+        error!("Interrupt handler error: {:?}", e);
     }
 }
 
@@ -153,35 +206,39 @@ pub enum IrqId {
     Pic2(u8),
 }
 
-struct PicPorts {
-    pic1_command: Port,
-    pic1_data: Port,
-    pic2_command: Port,
-    pic2_data: Port,
+struct PicIo {
+    pic1_io: IoRange,
+    pic2_io: IoRange,
 }
 
 pub struct InterruptHandlerData {
     #[allow(clippy::type_complexity)]
     handlers: InterruptGuarded<Option<HashMap<u8, Box<dyn Fn()>>>>,
-    ports: InterruptGuarded<Option<PicPorts>>,
+    pic_io: InterruptGuarded<Option<PicIo>>,
 }
 
 impl InterruptHandlerData {
     pub const fn new() -> InterruptHandlerData {
         InterruptHandlerData {
             handlers: InterruptGuarded::new(None),
-            ports: InterruptGuarded::new(None),
+            pic_io: InterruptGuarded::new(None),
         }
     }
 
-    fn init(&self, ports: PicPorts) {
+    fn init(&self, pic_io: PicIo) {
         *self.handlers.lock() = Some(Default::default());
-        *self.ports.lock() = Some(ports);
+        *self.pic_io.lock() = Some(pic_io);
     }
 
-    pub fn register<F: Fn() + 'static>(&self, irq_id: IrqId, f: F) {
-        let mut ports = self.ports.lock();
-        let ports = ports.as_mut().expect("InterruptHandlers not initialized");
+    pub fn register<F: Fn() + 'static>(
+        &self,
+        irq_id: IrqId,
+        f: F,
+    ) -> Result<(), InterruptHandlerRegisterError> {
+        let mut pic_io = self.pic_io.lock();
+        let pic_io = pic_io
+            .as_mut()
+            .ok_or(InterruptHandlerRegisterError::NotInitialized)?;
 
         let interrupt_num = match irq_id {
             IrqId::Internal(i) => i,
@@ -194,7 +251,7 @@ impl InterruptHandlerData {
 
             let handlers = handlers
                 .as_mut()
-                .expect("InterruptHandlers not initailized");
+                .ok_or(InterruptHandlerRegisterError::NotInitialized)?;
 
             assert!(
                 !handlers.contains_key(&interrupt_num),
@@ -205,75 +262,97 @@ impl InterruptHandlerData {
 
         match irq_id {
             IrqId::Pic1(i) => {
-                let mut mask = ports.pic1_data.readb();
+                let mut mask = pic_io
+                    .pic1_io
+                    .read_u8(PIC_DATA_OFFSET)
+                    .map_err(InterruptHandlerRegisterError::ReadPic1)?;
                 mask.set_bit(i, false);
-                ports.pic1_data.writeb(mask);
+                pic_io
+                    .pic1_io
+                    .write_u8(PIC_DATA_OFFSET, mask)
+                    .map_err(InterruptHandlerRegisterError::WritePic1)?;
             }
             IrqId::Pic2(i) => {
-                let mut mask = ports.pic2_data.readb();
+                let mut mask = pic_io
+                    .pic2_io
+                    .read_u8(PIC_DATA_OFFSET)
+                    .map_err(InterruptHandlerRegisterError::ReadPic2)?;
                 mask.set_bit(i, false);
-                ports.pic2_data.writeb(mask);
+                pic_io
+                    .pic2_io
+                    .write_u8(PIC_DATA_OFFSET, mask)
+                    .map_err(InterruptHandlerRegisterError::WritePic2)?;
             }
             _ => (),
         };
+
+        Ok(())
     }
 }
 
-fn pic_remap(offset1: u8, offset2: u8, ports: &mut PicPorts) {
+fn pic_remap(offset1: u8, offset2: u8, pic_io: &mut PicIo) -> Result<(), PicRemapError> {
     // Adapted from https://wiki.osdev.org/8259_PIC
     // https://pdos.csail.mit.edu/6.828/2005/readings/hardware/8259A.pdf
     const ICW1_ICW4: u8 = 0x01;
     const ICW1_INIT: u8 = 0x10;
     const ICW4_8086: u8 = 0x01;
 
-    let a1 = ports.pic1_data.readb();
-    let a2 = ports.pic2_data.readb();
+    (|| {
+        let a1 = pic_io.pic1_io.read_u8(PIC_DATA_OFFSET)?;
+        let a2 = pic_io.pic2_io.read_u8(PIC_DATA_OFFSET)?;
 
-    ports.pic1_command.writeb(ICW1_INIT | ICW1_ICW4);
-    ports.pic2_command.writeb(ICW1_INIT | ICW1_ICW4);
-    ports.pic1_data.writeb(offset1);
-    ports.pic2_data.writeb(offset2);
-    ports.pic1_data.writeb(4);
-    ports.pic2_data.writeb(2);
+        pic_io
+            .pic1_io
+            .write_u8(PIC_COMMAND_OFFSET, ICW1_INIT | ICW1_ICW4)?;
+        pic_io
+            .pic2_io
+            .write_u8(PIC_COMMAND_OFFSET, ICW1_INIT | ICW1_ICW4)?;
+        pic_io.pic1_io.write_u8(PIC_DATA_OFFSET, offset1)?;
+        pic_io.pic2_io.write_u8(PIC_DATA_OFFSET, offset2)?;
+        pic_io.pic1_io.write_u8(PIC_DATA_OFFSET, 4)?;
+        pic_io.pic2_io.write_u8(PIC_DATA_OFFSET, 2)?;
 
-    ports.pic1_data.writeb(ICW4_8086);
-    ports.pic2_data.writeb(ICW4_8086);
+        pic_io.pic1_io.write_u8(PIC_DATA_OFFSET, ICW4_8086)?;
+        pic_io.pic2_io.write_u8(PIC_DATA_OFFSET, ICW4_8086)?;
 
-    ports.pic1_data.writeb(a1);
-    ports.pic2_data.writeb(a2);
+        pic_io.pic1_io.write_u8(PIC_DATA_OFFSET, a1)?;
+        pic_io.pic2_io.write_u8(PIC_DATA_OFFSET, a2)?;
+        Ok(())
+    })()
+    .map_err(PicRemapError)?;
+
+    Ok(())
 }
 
-fn pic_disable_interrupts(ports: &mut PicPorts) {
+fn pic_disable_interrupts(pic_io: &mut PicIo) -> Result<(), DisableInterruptError> {
     // Leave IRQ2 unmasked as it is chained to pic2 which is fully masked. This makes
     // masking/unmasking logic easier downstream
-    ports.pic1_data.writeb(0b1111_1011);
-    ports.pic2_data.writeb(0xff);
+    pic_io
+        .pic1_io
+        .write_u8(PIC_DATA_OFFSET, 0b1111_1011)
+        .map_err(DisableInterruptError)?;
+    pic_io
+        .pic2_io
+        .write_u8(PIC_DATA_OFFSET, 0xff)
+        .map_err(DisableInterruptError)?;
+    Ok(())
 }
 
-pub fn init(port_manager: &mut PortManager) -> &'static InterruptHandlerData {
-    let pic1_command = port_manager
-        .request_port(0x20)
-        .expect("Failed to get pic 1 command");
-    let pic1_data = port_manager
-        .request_port(0x21)
-        .expect("Failed to get pic 1 data");
-    let pic2_command = port_manager
-        .request_port(0xA0)
-        .expect("Failed to get pic 2 command");
-    let pic2_data = port_manager
-        .request_port(0xA1)
-        .expect("Failed to get pic 2 data");
+pub fn init(
+    io_allocator: &mut IoAllocator,
+) -> Result<&'static InterruptHandlerData, InitInterruptError> {
+    let pic1_io = io_allocator
+        .request_io_range(0x20, 2)
+        .ok_or(InitInterruptError::AcquirePic1)?;
+    let pic2_io = io_allocator
+        .request_io_range(0xA0, 2)
+        .ok_or(InitInterruptError::AcquirePic2)?;
 
-    let mut ports = PicPorts {
-        pic1_command,
-        pic1_data,
-        pic2_command,
-        pic2_data,
-    };
+    let mut pic_io = PicIo { pic1_io, pic2_io };
 
-    pic_remap(PIC1_OFFSET, PIC2_OFFSET, &mut ports);
+    pic_remap(PIC1_OFFSET, PIC2_OFFSET, &mut pic_io).map_err(InitInterruptError::RemapPic)?;
 
-    pic_disable_interrupts(&mut ports);
+    pic_disable_interrupts(&mut pic_io).map_err(InitInterruptError::DisableInterrupts)?;
 
     for i in 0..255 {
         ISRS.lock()[i] = generate_interrupt_stub(i as u8);
@@ -308,7 +387,7 @@ pub fn init(port_manager: &mut PortManager) -> &'static InterruptHandlerData {
     }
 
     debug!("{:?}", read_idtr());
-    INTERRUPT_HANDLER_DATA.init(ports);
+    INTERRUPT_HANDLER_DATA.init(pic_io);
 
-    &INTERRUPT_HANDLER_DATA
+    Ok(&INTERRUPT_HANDLER_DATA)
 }

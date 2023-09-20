@@ -4,11 +4,12 @@ use core::{
     future::Future,
     pin::Pin,
 };
-use port_manager::{Port, PortManager};
+use io_allocator::{IoAllocator, IoOffset, IoRange};
 
 #[macro_use]
 pub mod vga;
-pub mod port_manager;
+pub mod io_allocator;
+pub mod pci;
 pub mod rtc;
 pub mod serial;
 
@@ -32,7 +33,7 @@ unsafe impl Sync for Printer {}
 pub static PRINTER: Printer = Printer::new();
 
 struct ExitPort {
-    port: RefCell<Option<Port>>,
+    port: RefCell<Option<IoRange>>,
 }
 
 impl ExitPort {
@@ -53,12 +54,12 @@ pub fn init_stdio(print_fn: Box<PrinterFunction>) {
     }
 }
 
-pub fn init_late(port_manager: &mut PortManager) {
+pub fn init_late(io_allocator: &mut IoAllocator) {
     const ISA_DEBUG_EXIT_PORT_NUM: u16 = 0xf4;
     let mut port = EXIT_PORT.port.borrow_mut();
     *port = Some(
-        port_manager
-            .request_port(ISA_DEBUG_EXIT_PORT_NUM)
+        io_allocator
+            .request_io_range(ISA_DEBUG_EXIT_PORT_NUM, 1)
             .expect("Failed to get exit port"),
     )
 }
@@ -67,5 +68,6 @@ pub unsafe fn exit(code: u8) {
     let mut port = EXIT_PORT.port.borrow_mut();
     port.as_mut()
         .expect("exit port not initialized")
-        .writeb(code);
+        .write_u8(IoOffset::new(0), code)
+        .expect("failed to write exit port");
 }
