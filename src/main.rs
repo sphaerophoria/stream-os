@@ -27,12 +27,12 @@ mod interrupts;
 mod io;
 mod libc;
 mod multiboot;
+mod rtl8139;
 mod sleep;
 mod time;
 mod util;
 
 use alloc::{boxed::Box, rc::Rc, vec};
-use io::io_allocator::IoOffset;
 
 use core::{arch::global_asm, cell::RefCell, fmt::Write, panic::PanicInfo};
 
@@ -40,17 +40,14 @@ use crate::{
     future::execute_fut,
     interrupts::{InitInterruptError, InterruptHandlerData},
     io::{
-        io_allocator::IoAllocator,
-        pci::{Pci, PciDevice},
-        rtc::Rtc,
-        serial::Serial,
-        vga::TerminalWriter,
+        io_allocator::IoAllocator, pci::Pci, rtc::Rtc, serial::Serial, vga::TerminalWriter,
         PrinterFunction,
     },
     multiboot::MultibootInfo,
+    rtl8139::Rtl8139,
     sleep::WakeupList,
     time::MonotonicTime,
-    util::{bit_manipulation::GetBits, interrupt_guard::InterruptGuarded},
+    util::interrupt_guard::InterruptGuarded,
 };
 
 // Include boot.s which defines _start as inline assembly in main. This allows us to do more fine
@@ -123,6 +120,7 @@ struct Kernel {
     interrupt_handlers: &'static InterruptHandlerData,
     rtc: Rtc,
     pci: Pci,
+    rtl8139: Rtl8139,
     serial: Rc<RefCell<Serial>>,
     terminal_writer: Rc<RefCell<TerminalWriter>>,
     monotonic_time: Rc<MonotonicTime>,
@@ -155,13 +153,16 @@ impl Kernel {
         let rtc = io::rtc::Rtc::new(&mut io_allocator, interrupt_handlers, on_tick)
             .expect("Failed to construct rtc");
 
-        let pci = Pci::new(&mut io_allocator).expect("Failed to initialize pci");
+        let mut pci = Pci::new(&mut io_allocator).expect("Failed to initialize pci");
+
+        let rtl8139 = Rtl8139::new(&mut pci).expect("Failed to initialize rtl8139");
 
         Ok(Kernel {
             interrupt_handlers,
             io_allocator,
             rtc,
             pci,
+            rtl8139,
             serial,
             terminal_writer,
             monotonic_time,
@@ -183,30 +184,7 @@ impl Kernel {
         let date = self.rtc.read().expect("failed to read date");
         info!("Current date modified in cmos: {:?}", date);
 
-        let rtl_device = match self.pci.find_device(0x10ec, 0x8139).unwrap().unwrap() {
-            PciDevice::General(v) => v,
-            _ => panic!("RTL device not general as expected"),
-        };
-        let io_base = rtl_device.find_io_base(&mut self.pci).unwrap();
-        assert!(io_base <= u16::MAX as u32);
-        let mut rtl_io = self
-            .io_allocator
-            .request_io_range(io_base as u16, 8)
-            .unwrap();
-        let mut mac = alloc::vec::Vec::new();
-        let first_4 = rtl_io.read_32(IoOffset::new(0)).unwrap();
-        mac.push(first_4.get_bits(0, 8));
-        mac.push(first_4.get_bits(8, 8));
-        mac.push(first_4.get_bits(16, 8));
-        mac.push(first_4.get_bits(24, 8));
-        let second_4 = rtl_io.read_32(IoOffset::new(4)).unwrap();
-        mac.push(second_4.get_bits(0, 8));
-        mac.push(second_4.get_bits(8, 8));
-        info!("Mac address received through io space: {:x?}", mac);
-
-        let memory_base = rtl_device.find_mmap_base(&mut self.pci).unwrap() as *const u8;
-        let mac = core::slice::from_raw_parts(memory_base, 6);
-        info!("Mac address received through memory space: {:x?}", mac);
+        self.rtl8139.log_mac();
 
         info!("Sleep for 3 seconds");
 
