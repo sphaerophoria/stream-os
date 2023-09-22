@@ -155,7 +155,8 @@ impl Kernel {
 
         let mut pci = Pci::new(&mut io_allocator).expect("Failed to initialize pci");
 
-        let rtl8139 = Rtl8139::new(&mut pci).expect("Failed to initialize rtl8139");
+        let rtl8139 =
+            Rtl8139::new(&mut pci, interrupt_handlers, true).expect("Failed to initialize rtl8139");
 
         Ok(Kernel {
             interrupt_handlers,
@@ -184,11 +185,27 @@ impl Kernel {
         let date = self.rtc.read().expect("failed to read date");
         info!("Current date modified in cmos: {:?}", date);
 
-        self.rtl8139.log_mac();
+        self.rtl8139.log_mac().await;
 
-        info!("Sleep for 3 seconds");
+        let send = async {
+            info!("Sleeping for a second before writing a packet");
+            sleep::sleep(1.0, &self.monotonic_time, &self.wakeup_list).await;
+            self.rtl8139
+                .write(b"a long test string that is over 64 bytes long or else it will crash")
+                .await
+                .unwrap();
+        };
 
-        sleep::sleep(3.0, &self.monotonic_time, &self.wakeup_list).await;
+        let recv = async {
+            info!("Waiting for a packet (loopback)");
+            self.rtl8139
+                .read(|packet| {
+                    println!("packet: {}", core::str::from_utf8(packet).unwrap());
+                })
+                .await;
+        };
+
+        futures::future::join(send, recv).await;
 
         info!("And now we exit/halt");
     }

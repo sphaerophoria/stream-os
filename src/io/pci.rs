@@ -3,6 +3,8 @@ use crate::{
     util::bit_manipulation::{GetBits, SetBits},
 };
 
+use hashbrown::HashSet;
+
 const PCI_CONFIG_OFFSET: IoOffset = IoOffset::new(0);
 const PCI_DATA_OFFSET: IoOffset = IoOffset::new(4);
 
@@ -11,6 +13,7 @@ pub struct PciIoUnavailable;
 
 pub struct Pci {
     pci_io: IoRange,
+    allocated_devs: HashSet<PciAddress>,
 }
 
 impl Pci {
@@ -18,7 +21,11 @@ impl Pci {
         let pci_io = io_allocator
             .request_io_range(0xCF8, 8)
             .ok_or(PciIoUnavailable)?;
-        Ok(Pci { pci_io })
+        let allocated_devs = HashSet::new();
+        Ok(Pci {
+            pci_io,
+            allocated_devs,
+        })
     }
 
     fn select_pci_address(&mut self, bus: u8, slot: u8, func: u8, offset: u8) {
@@ -72,23 +79,44 @@ impl Pci {
 #[derive(Debug)]
 pub struct InvalidHeaderError;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 struct PciAddress {
     bus: u8,
     slot: u8,
 }
 
 impl PciAddress {
-    pub fn read_register(&self, pci: &mut Pci, register: u8) -> u32 {
+    fn read_register(&mut self, pci: &mut Pci, register: u8) -> u32 {
         pci.config_read(self.bus, self.slot, 0, register * 4)
     }
 
-    pub fn write_register(&self, pci: &mut Pci, register: u8, value: u32) {
+    fn write_register(&mut self, pci: &mut Pci, register: u8, value: u32) {
         pci.config_write(self.bus, self.slot, 0, register * 4, value)
     }
 
-    fn upgrade(self, pci: &mut Pci) -> Result<PciDevice, InvalidHeaderError> {
+    fn enable_bus_mastering(&mut self, pci: &mut Pci) {
+        const STATUS_COMMAND_OFFSET: u8 = 4;
+        // Read offset 4 == register 1 where the command register is
+        let mut status_command = pci.config_read(self.bus, self.slot, 0, STATUS_COMMAND_OFFSET);
+        // Bus mastering bit is bit 2
+        status_command.set_bit(2, true);
+        pci.config_write(
+            self.bus,
+            self.slot,
+            0,
+            STATUS_COMMAND_OFFSET,
+            status_command,
+        );
+    }
+
+    fn upgrade(mut self, pci: &mut Pci) -> Result<PciDevice, InvalidHeaderError> {
         let header_type = self.read_register(pci, 3).get_bits(16, 8);
+
+        if pci.allocated_devs.contains(&self) {
+            panic!("Device already in use");
+        }
+
+        pci.allocated_devs.insert(self.clone());
         match header_type {
             0 => Ok(PciDevice::General(GeneralPciDevice { addr: self })),
             1 => Ok(PciDevice::PciPciBridge),
@@ -111,7 +139,7 @@ pub struct GeneralPciDevice {
 
 impl GeneralPciDevice {
     #[allow(unused)]
-    pub fn find_io_base(&self, pci: &mut Pci) -> Option<u32> {
+    pub fn find_io_base(&mut self, pci: &mut Pci) -> Option<u32> {
         for i in 0..=5 {
             let base_address = self.addr.read_register(pci, 4 + i);
             if base_address.get_bit(0) && base_address.get_bits(2, 30) > 0 {
@@ -122,7 +150,7 @@ impl GeneralPciDevice {
         None
     }
 
-    pub fn find_mmap_range(&self, pci: &mut Pci) -> Option<MmapRange> {
+    pub fn find_mmap_range(&mut self, pci: &mut Pci) -> Option<MmapRange> {
         for i in 0..=5 {
             let register_offset = 4 + i;
             let base_address = self.addr.read_register(pci, register_offset);
@@ -142,6 +170,16 @@ impl GeneralPciDevice {
         }
 
         None
+    }
+
+    pub fn enable_bus_mastering(&mut self, pci: &mut Pci) {
+        self.addr.enable_bus_mastering(pci);
+    }
+
+    pub fn get_irq_num(&mut self, pci: &mut Pci) -> u8 {
+        let reg = self.addr.read_register(pci, 0xf);
+        let irq = reg.get_bits(0, 8);
+        irq as u8
     }
 }
 
