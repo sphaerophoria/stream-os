@@ -5,9 +5,9 @@ macro_rules! print {
             let printer = &mut *crate::io::PRINTER.inner.get();
             if let Some(printer) = printer.as_mut() {
                 if let Some(s) = format_args!($($arg)*).as_str() {
-                    printer(s).await;
+                    printer(s);
                 } else {
-                    printer(&alloc::format!($($arg)*)).await;
+                    printer(&alloc::format!($($arg)*));
                 }
             }
         }

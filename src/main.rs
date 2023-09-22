@@ -65,27 +65,39 @@ extern "C" {
 
 struct EarlyInitHandles {
     io_allocator: IoAllocator,
+    terminal_writer: Rc<RefCell<TerminalWriter>>,
+    serial: Rc<RefCell<Serial>>,
     interrupt_handlers: &'static InterruptHandlerData,
-    monotonic_time: Rc<MonotonicTime>,
-    wakeup_list: Rc<WakeupList>,
 }
 
-unsafe fn early_init(info: *const MultibootInfo) -> Result<EarlyInitHandles, InitInterruptError> {
+unsafe fn interrupt_guarded_init(
+    info: *const MultibootInfo,
+) -> Result<EarlyInitHandles, InitInterruptError> {
+    let _guard = InterruptGuarded::new(());
+    let _guard = _guard.lock();
+
     allocator::init(&*info);
     logger::init(Default::default());
 
+    let mut io_allocator = io::io_allocator::IoAllocator::new();
+    let terminal_writer = Rc::new(RefCell::new(TerminalWriter::new()));
+    let serial = Rc::new(RefCell::new(
+        Serial::new(&mut io_allocator).expect("Failed to initialize serial"),
+    ));
+
+    io::init_stdio(gen_printers(
+        Rc::clone(&serial),
+        Rc::clone(&terminal_writer),
+    ));
     gdt::init();
 
-    let mut io_allocator = io::io_allocator::IoAllocator::new();
     let interrupt_handlers = interrupts::init(&mut io_allocator)?;
 
-    let monotonic_time = Rc::new(MonotonicTime::new(Rtc::tick_freq()));
-    let wakeup_list = Rc::new(WakeupList::new());
     Ok(EarlyInitHandles {
         io_allocator,
+        terminal_writer,
+        serial,
         interrupt_handlers,
-        monotonic_time,
-        wakeup_list,
     })
 }
 
@@ -97,17 +109,11 @@ fn gen_printers(
     Box::new(move |s| {
         let serial = Rc::clone(&serial);
         let terminal_writer = Rc::clone(&terminal_writer);
-        alloc::boxed::Box::pin(async move {
-            terminal_writer
-                .borrow_mut()
-                .write_str(s)
-                .expect("Failed to write to terminal");
-            serial
-                .borrow_mut()
-                .write_str(s)
-                .await
-                .expect("failed to write to terminal");
-        })
+        terminal_writer
+            .borrow_mut()
+            .write_str(s)
+            .expect("Failed to write to terminal");
+        serial.borrow_mut().write_str(s);
     })
 }
 
@@ -124,22 +130,16 @@ struct Kernel {
 }
 
 impl Kernel {
-    async unsafe fn init(early_handles: EarlyInitHandles) -> Kernel {
-        let mut io_allocator = early_handles.io_allocator;
-        let interrupt_handlers = early_handles.interrupt_handlers;
-        let wakeup_list = early_handles.wakeup_list;
-        let monotonic_time = early_handles.monotonic_time;
+    unsafe fn init(info: *const MultibootInfo) -> Result<Kernel, InitInterruptError> {
+        let EarlyInitHandles {
+            mut io_allocator,
+            terminal_writer,
+            serial,
+            interrupt_handlers,
+        } = interrupt_guarded_init(info)?;
 
-        let serial = Rc::new(RefCell::new(
-            Serial::new(&mut io_allocator, interrupt_handlers)
-                .expect("Failed to initialize serial"),
-        ));
-
-        let terminal_writer = Rc::new(RefCell::new(TerminalWriter::new()));
-
-        let printer_function = gen_printers(Rc::clone(&serial), Rc::clone(&terminal_writer));
-
-        io::init_stdio(printer_function);
+        let monotonic_time = Rc::new(MonotonicTime::new(Rtc::tick_freq()));
+        let wakeup_list = Rc::new(WakeupList::new());
         io::init_late(&mut io_allocator);
 
         let on_tick = {
@@ -157,7 +157,7 @@ impl Kernel {
 
         let pci = Pci::new(&mut io_allocator).expect("Failed to initialize pci");
 
-        Kernel {
+        Ok(Kernel {
             interrupt_handlers,
             io_allocator,
             rtc,
@@ -166,7 +166,7 @@ impl Kernel {
             terminal_writer,
             monotonic_time,
             wakeup_list,
-        }
+        })
     }
 
     async unsafe fn demo(&mut self) {
@@ -202,11 +202,11 @@ impl Kernel {
         let second_4 = rtl_io.read_32(IoOffset::new(4)).unwrap();
         mac.push(second_4.get_bits(0, 8));
         mac.push(second_4.get_bits(8, 8));
-        println!("Mac address received through io space: {:x?}", mac);
+        info!("Mac address received through io space: {:x?}", mac);
 
         let memory_base = rtl_device.find_mmap_base(&mut self.pci).unwrap() as *const u8;
         let mac = core::slice::from_raw_parts(memory_base, 6);
-        println!("Mac address received through memory space: {:x?}", mac);
+        info!("Mac address received through memory space: {:x?}", mac);
 
         info!("Sleep for 3 seconds");
 
@@ -216,10 +216,10 @@ impl Kernel {
     }
 }
 
-async unsafe fn async_main(early_handles: EarlyInitHandles) {
+async unsafe fn async_main(mut kernel: Kernel) {
     let sleep = {
-        let monotonic_time = Rc::clone(&early_handles.monotonic_time);
-        let wakeup_list = Rc::clone(&early_handles.wakeup_list);
+        let monotonic_time = Rc::clone(&kernel.monotonic_time);
+        let wakeup_list = Rc::clone(&kernel.wakeup_list);
         move |t| {
             let monotonic_time = Rc::clone(&monotonic_time);
             let wakeup_list = Rc::clone(&wakeup_list);
@@ -227,8 +227,7 @@ async unsafe fn async_main(early_handles: EarlyInitHandles) {
         }
     };
 
-    let kernel_fut = async {
-        let mut kernel = Kernel::init(early_handles).await;
+    let demo_fut = async {
         #[cfg(test)]
         {
             test_main();
@@ -242,21 +241,14 @@ async unsafe fn async_main(early_handles: EarlyInitHandles) {
         sleep(0.1).await;
     };
 
-    futures::future::select(Box::pin(logger::service(&sleep)), Box::pin(kernel_fut)).await;
+    futures::future::select(Box::pin(logger::service(&sleep)), Box::pin(demo_fut)).await;
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const MultibootInfo) -> i32 {
-    let early_handles = {
-        // Disable interrupts until interrupts are initialized
-        let interrupt_guard = InterruptGuarded::new(());
-        #[allow(unused)]
-        let interrupt_guard = interrupt_guard.lock();
+    let kernel = Kernel::init(info).expect("Failed to initialize kernel");
 
-        early_init(info)
-    };
-
-    execute_fut(async_main(early_handles.unwrap()));
+    execute_fut(async_main(kernel));
 
     io::exit(0);
     0
@@ -266,13 +258,9 @@ pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const Multibo
 #[panic_handler]
 fn panic(panic_info: &PanicInfo) -> ! {
     if let Some(args) = panic_info.message() {
-        execute_fut(async {
-            println!("{}", args);
-        });
+        println!("{}", args);
     } else {
-        execute_fut(async {
-            println!("Paniced!");
-        });
+        println!("Paniced!");
     }
 
     unsafe {

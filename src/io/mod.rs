@@ -1,9 +1,5 @@
 use alloc::boxed::Box;
-use core::{
-    cell::{RefCell, UnsafeCell},
-    future::Future,
-    pin::Pin,
-};
+use core::cell::{RefCell, UnsafeCell};
 use io_allocator::{IoAllocator, IoOffset, IoRange};
 
 #[macro_use]
@@ -13,7 +9,7 @@ pub mod pci;
 pub mod rtc;
 pub mod serial;
 
-pub type PrinterFunction = dyn FnMut(&'_ str) -> Pin<Box<dyn '_ + Future<Output = ()>>>;
+pub type PrinterFunction = dyn FnMut(&'_ str);
 
 pub struct Printer {
     #[allow(clippy::type_complexity)]

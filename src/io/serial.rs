@@ -1,10 +1,4 @@
-use core::task::Poll;
-
-use crate::{
-    future::wakeup_executor,
-    interrupts::{InterruptHandlerData, InterruptHandlerRegisterError, IrqId},
-    io::io_allocator::{IoAllocator, IoOffset, IoRange, OffsetOutOfRange},
-};
+use crate::io::io_allocator::{IoAllocator, IoOffset, IoRange, OffsetOutOfRange};
 
 const BASE_ADDR: u16 = 0x3f8;
 const DATA_OFFSET: IoOffset = IoOffset::new(0);
@@ -19,7 +13,6 @@ const _SCRATCH_OFFSET: IoOffset = IoOffset::new(7);
 #[derive(Debug)]
 pub enum SerialInitError {
     IoRangeReserved,
-    RegisterInterrupt(InterruptHandlerRegisterError),
     WriteFailed(OffsetOutOfRange),
     Loopback,
 }
@@ -32,23 +25,12 @@ pub struct Serial {
 }
 
 impl Serial {
-    pub fn new(
-        io_allocator: &mut IoAllocator,
-        interrupt_handlers: &InterruptHandlerData,
-    ) -> Result<Serial, SerialInitError> {
+    pub fn new(io_allocator: &mut IoAllocator) -> Result<Serial, SerialInitError> {
         use SerialInitError::*;
 
         let mut serial_io = io_allocator
             .request_io_range(BASE_ADDR, 8)
             .ok_or(IoRangeReserved)?;
-
-        interrupt_handlers
-            .register(IrqId::Pic1(4), {
-                move || {
-                    wakeup_executor();
-                }
-            })
-            .map_err(RegisterInterrupt)?;
 
         (|| -> Result<(), OffsetOutOfRange> {
             serial_io.write_u8(ENABLE_INTERRUPT_OFFSET, 0x02)?; // Enable transmit empty
@@ -77,17 +59,6 @@ impl Serial {
         Ok(Serial { serial_io })
     }
 
-    #[allow(unused)]
-    async fn wait_transmit_empty(&mut self) {
-        if is_transmit_ready(&mut self.serial_io) {
-            return;
-        }
-        let waiter = TransmitEmptyWaiter {
-            serial_io: &mut self.serial_io,
-        };
-        waiter.await;
-    }
-
     fn write_byte(&mut self, a: u8) -> Result<(), WriteError> {
         while !is_transmit_ready(&mut self.serial_io) {}
 
@@ -98,13 +69,10 @@ impl Serial {
         Ok(())
     }
 
-    pub async fn write_str(&mut self, s: &str) -> Result<(), WriteError> {
+    pub fn write_str(&mut self, s: &str) {
         for b in s.as_bytes() {
-            self.wait_transmit_empty().await;
-            self.write_byte(*b)?;
+            self.write_byte(*b).expect("failed to write to serial");
         }
-
-        Ok(())
     }
 }
 
@@ -114,32 +82,4 @@ fn is_transmit_ready(serial_io: &mut IoRange) -> bool {
         .expect("line status not allocated")
         & 0x20)
         != 0
-}
-
-struct TransmitEmptyWaiter<'a> {
-    serial_io: &'a mut IoRange,
-}
-
-impl core::future::Future for TransmitEmptyWaiter<'_> {
-    type Output = ();
-
-    fn poll(
-        mut self: core::pin::Pin<&mut Self>,
-        _cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<Self::Output> {
-        if is_transmit_ready(self.serial_io) {
-            return Poll::Ready(());
-        }
-
-        Poll::Pending
-    }
-}
-
-impl core::fmt::Write for Serial {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        for b in s.as_bytes() {
-            self.write_byte(*b).expect("failed to write to serial");
-        }
-        Ok(())
-    }
 }
