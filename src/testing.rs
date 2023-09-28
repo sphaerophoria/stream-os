@@ -11,22 +11,31 @@ pub struct TestCase {
 }
 
 pub fn test_runner(test_fns: &[&TestCase]) {
+    let mut any_failed = false;
     future::execute_fut(async {
         for test_case in test_fns {
             print!("{}... ", test_case.name);
             if let Err(e) = (test_case.test)().await {
                 println!("{}", e);
+                any_failed = true;
             } else {
                 println!("[ok]");
             }
         }
     });
+
+    if any_failed {
+        unsafe {
+            crate::io::exit(1);
+        }
+    }
 }
 
 macro_rules! create_test {
     ($name:ident, $content:block) => {
         paste::paste! {
             #[test_case]
+            #[allow(non_upper_case_globals)]
             static $name: TestCase = TestCase {
                 name: concat!(file!(), " ", stringify!($name)),
                 test: &[<$name _test>],

@@ -27,12 +27,13 @@ mod interrupts;
 mod io;
 mod libc;
 mod multiboot;
+mod net;
 mod rtl8139;
 mod sleep;
 mod time;
 mod util;
 
-use alloc::{boxed::Box, rc::Rc, vec};
+use alloc::{boxed::Box, rc::Rc, vec, vec::Vec};
 
 use core::{arch::global_asm, cell::RefCell, fmt::Write, panic::PanicInfo};
 
@@ -44,6 +45,10 @@ use crate::{
         PrinterFunction,
     },
     multiboot::MultibootInfo,
+    net::{
+        ArpFrame, ArpFrameParams, ArpOperation, EthernetFrameParams, ParsedIpv4Frame, ParsedPacket,
+        UnknownArpOperation,
+    },
     rtl8139::Rtl8139,
     sleep::WakeupList,
     time::MonotonicTime,
@@ -54,6 +59,8 @@ use crate::{
 // grained setup than if we used a naked _start function in rust. Theoretically we could use a
 // naked function + some inline asm, but this seems much more straight forward.
 global_asm!(include_str!("boot.s"), options(att_syntax));
+
+const STATIC_IP: [u8; 4] = [192, 168, 122, 55];
 
 extern "C" {
     static KERNEL_START: u32;
@@ -75,7 +82,6 @@ unsafe fn interrupt_guarded_init(
 
     allocator::init(&*info);
     logger::init(Default::default());
-
     let mut io_allocator = io::io_allocator::IoAllocator::new();
     let terminal_writer = Rc::new(RefCell::new(TerminalWriter::new()));
     let serial = Rc::new(RefCell::new(
@@ -155,8 +161,8 @@ impl Kernel {
 
         let mut pci = Pci::new(&mut io_allocator).expect("Failed to initialize pci");
 
-        let rtl8139 =
-            Rtl8139::new(&mut pci, interrupt_handlers, true).expect("Failed to initialize rtl8139");
+        let rtl8139 = Rtl8139::new(&mut pci, interrupt_handlers, false)
+            .expect("Failed to initialize rtl8139");
 
         Ok(Kernel {
             interrupt_handlers,
@@ -187,27 +193,133 @@ impl Kernel {
 
         self.rtl8139.log_mac().await;
 
-        let send = async {
-            info!("Sleeping for a second before writing a packet");
-            sleep::sleep(1.0, &self.monotonic_time, &self.wakeup_list).await;
-            self.rtl8139
-                .write(b"a long test string that is over 64 bytes long or else it will crash")
-                .await
-                .unwrap();
-        };
-
+        info!("Waiting for UDP message for 3 seconds...");
         let recv = async {
-            info!("Waiting for a packet (loopback)");
-            self.rtl8139
-                .read(|packet| {
-                    println!("packet: {}", core::str::from_utf8(packet).unwrap());
-                })
-                .await;
+            recv_loop(&self.rtl8139).await;
         };
+        let recv = core::pin::pin!(recv);
 
-        futures::future::join(send, recv).await;
+        let sleep_fut = sleep::sleep(3.0, &self.monotonic_time, &self.wakeup_list);
+        let sleep_fut = core::pin::pin!(sleep_fut);
+        info!("Current date modified in cmos: {:?}", date);
+        futures::future::select(recv, sleep_fut).await;
 
         info!("And now we exit/halt");
+    }
+}
+
+async fn handle_arp_frame(arp_frame: &ArpFrame<'_>, rtl8139: &Rtl8139, mac: &[u8; 6]) {
+    debug!("Received arp frame: {:?}", arp_frame);
+
+    match arp_frame.operation() {
+        Ok(ArpOperation::Request) => (),
+        Ok(ArpOperation::Reply) => {
+            debug!("Received arp reply, ignoring");
+            return;
+        }
+        Err(UnknownArpOperation(v)) => {
+            debug!("Received unknown arp operation, {}", v);
+        }
+    }
+
+    if arp_frame.operation() != Ok(ArpOperation::Request) {
+        return;
+    }
+
+    if arp_frame.target_hardware_address() != mac
+        && arp_frame.target_protocol_address() != STATIC_IP
+    {
+        return;
+    }
+
+    let mut params =
+        ArpFrameParams::try_from(arp_frame).expect("Arp frame should be validated above");
+
+    core::mem::swap(
+        &mut params.target_protocol_address,
+        &mut params.sender_protocol_address,
+    );
+    core::mem::swap(
+        &mut params.target_hardware_address,
+        &mut params.sender_hardware_address,
+    );
+    params.operation = ArpOperation::Reply;
+    params.sender_hardware_address = *mac;
+    params.sender_protocol_address = STATIC_IP;
+
+    let response = net::generate_arp_frame(&params);
+
+    let response_frame = net::generate_ethernet_frame(&EthernetFrameParams {
+        dest_mac: arp_frame
+            .sender_hardware_address()
+            .try_into()
+            .expect("Invalid length for dest mac"),
+        source_mac: *mac,
+        // FIXME: enum with to_int() or something
+        ether_type: 0x0806,
+        payload: &response,
+    });
+
+    rtl8139.write(&response_frame).await.unwrap();
+}
+
+// FIXME: Where does this belong?
+async fn handle_packet(packet: Vec<u8>, rtl8139: &Rtl8139, mac: &[u8; 6]) {
+    let packet = net::parse_packet(&packet);
+
+    let packet = match packet {
+        Ok(v) => v,
+        Err(e) => {
+            debug!("Received invalid packet: {:?}", e);
+            return;
+        }
+    };
+
+    match packet {
+        ParsedPacket::Arp(arp_frame) => {
+            handle_arp_frame(&arp_frame, rtl8139, mac).await;
+        }
+        ParsedPacket::Ipv4(ipv4_frame) => {
+            let frame = net::parse_ipv4(&ipv4_frame);
+            match frame {
+                Ok(ParsedIpv4Frame::Udp(udp_frame)) => {
+                    unsafe {
+                        info!(
+                            "Received UDP message: {}",
+                            core::str::from_utf8_unchecked(udp_frame.data())
+                        );
+                    }
+                    if udp_frame.data() == b"exit\n" {
+                        unsafe {
+                            io::exit(0);
+                        }
+                    }
+                }
+                Ok(ParsedIpv4Frame::Unknown(p)) => {
+                    debug!("Unknown ipv4 protocol {:?}", p);
+                }
+                Err(e) => {
+                    debug!("Invalid ipv4 packet: {:?}", e);
+                }
+            }
+        }
+        ParsedPacket::Unknown(t) => {
+            debug!("Found unknown packet type: {:#06x}", t);
+        }
+    }
+}
+
+async fn recv_loop(rtl8139: &Rtl8139) {
+    let mac = rtl8139.get_mac();
+
+    loop {
+        info!("Waiting for a packet");
+        rtl8139
+            .read(|packet| {
+                // FIXME: Avoid copying but types are hard
+                handle_packet(packet.to_vec(), rtl8139, &mac)
+            })
+            .await;
     }
 }
 

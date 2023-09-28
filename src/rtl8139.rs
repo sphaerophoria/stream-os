@@ -210,7 +210,9 @@ unsafe fn init_receive_configuration(base: *mut u8) -> Result<(), ValueNotSet<u3
     let global_receive_config_reg = base.add(RECEIVE_CONFIG_OFFSET) as *mut u32;
     let mut global_receive_config = global_receive_config_reg.read_volatile();
     // Accept every packet that ever existed
-    global_receive_config.set_bits(0, 6, 0x3f);
+    global_receive_config.set_bits(0, 6, 0x00);
+    global_receive_config.set_bit(1, true);
+    global_receive_config.set_bit(3, true);
     // Overwrite start of buffer when too much data (WRAP)
     global_receive_config.set_bit(7, true);
     global_receive_config_reg.write_volatile(global_receive_config);
@@ -312,18 +314,13 @@ async unsafe fn get_packet(base: *mut u8, receive_buf: &[u8]) -> &[u8] {
     // header 16 bit
     // length 16 bit
     // packet
-    let capr_reg = base.add(CAPR_OFFSET) as *mut u16;
-    let cbr_reg = base.add(CBR_OFFSET) as *mut u16;
-
-    ReceiverWaiter { capr_reg, cbr_reg }.await;
-
     let capr = (base.add(CAPR_OFFSET) as *mut u16).read_volatile();
     let cbr = (base.add(CBR_OFFSET) as *mut u16).read_volatile();
     let start_offset = capr.wrapping_add(16);
     // Qemu source says this is offset by 16 bits
     let header = receive_buf.as_ptr().add(start_offset as usize) as *const u16;
     // Packet includes a 4 byte CRC at the end which we don't want to copy
-    let length = header.wrapping_add(1).read_volatile() - 4;
+    let length = header.wrapping_add(1).read_volatile();
 
     debug!("Received header: {:x}", header.read_volatile());
     debug!("Received buf length: {}", length);
@@ -452,15 +449,18 @@ impl Inner {
         Ok(())
     }
 
-    pub async fn read<F>(&mut self, on_read: F)
+    pub async fn read<F, Fut>(&mut self, on_read: F) -> Fut
     where
-        F: Fn(&[u8]),
+        F: Fn(&[u8]) -> Fut,
+        Fut: core::future::Future<Output = ()>,
     {
         let data = unsafe { get_packet(self.base, &self.receive_buf).await };
-        on_read(data);
+        let fut = on_read(data);
         unsafe {
             increment_capr(self.base, &self.receive_buf);
         }
+
+        fut
     }
 
     pub fn log_mac(&mut self) {
@@ -470,6 +470,14 @@ impl Inner {
         }
 
         info!("Mac address: {:x?}", mac);
+    }
+
+    pub fn get_mac(&mut self) -> [u8; 6] {
+        let mut mac = [0; 6];
+        for (i, v) in mac.iter_mut().enumerate() {
+            unsafe { *v = self.base.add(i).read_volatile() }
+        }
+        mac
     }
 }
 
@@ -488,29 +496,37 @@ impl Rtl8139 {
     }
 
     pub async fn write(&self, packet: &[u8]) -> Result<(), PacketTooShort> {
-        self.inner.lock().await.write(packet).await
+        let mut inner = self.inner.lock().await;
+        inner.write(packet).await
     }
 
-    pub async fn read<F>(&self, on_read: F)
+    pub async fn read<F, Fut>(&self, on_read: F)
     where
-        F: Fn(&[u8]),
+        F: Fn(&[u8]) -> Fut,
+        Fut: core::future::Future<Output = ()>,
     {
         unsafe {
             let base = self.inner.lock().await.base;
             let capr_reg = base.add(CAPR_OFFSET) as *mut u16;
             let cbr_reg = base.add(CBR_OFFSET) as *mut u16;
 
-            loop {
+            let fut = loop {
                 ReceiverWaiter { capr_reg, cbr_reg }.await;
+                //sleep(1.0).await;
                 if let Some(mut v) = self.inner.try_lock() {
-                    v.read(on_read).await;
-                    break;
-                }
-            }
+                    let fut = v.read(on_read).await;
+                    break fut;
+                };
+            };
+            fut.await;
         }
     }
 
     pub async fn log_mac(&self) {
         self.inner.lock().await.log_mac();
+    }
+
+    pub fn get_mac(&self) -> [u8; 6] {
+        self.inner.try_lock().unwrap().get_mac()
     }
 }
