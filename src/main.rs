@@ -285,7 +285,7 @@ impl Kernel {
 
             info!("Resolved mac address!: {:?}", mac);
 
-            let udp_frame = net::generate_udp_frame(6000, b"hello from inside the os");
+            let udp_frame = net::generate_udp_frame(6000, b"hello from inside the os\n");
             let ipv4_frame = net::generate_ipv4_frame(
                 &udp_frame,
                 net::Ipv4Protocol::Udp,
