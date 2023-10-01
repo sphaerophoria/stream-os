@@ -34,8 +34,17 @@ mod time;
 mod util;
 
 use alloc::{boxed::Box, rc::Rc, vec, vec::Vec};
+use futures::future::Either;
 
-use core::{arch::global_asm, cell::RefCell, fmt::Write, panic::PanicInfo};
+use core::{
+    arch::global_asm,
+    cell::RefCell,
+    fmt::Write,
+    panic::PanicInfo,
+    pin::Pin,
+    task::{Context, Poll},
+};
+use hashbrown::HashMap;
 
 use crate::{
     future::execute_fut,
@@ -46,12 +55,13 @@ use crate::{
     },
     multiboot::MultibootInfo,
     net::{
-        ArpFrame, ArpFrameParams, ArpOperation, EthernetFrameParams, ParsedIpv4Frame, ParsedPacket,
-        UnknownArpOperation,
+        ArpFrame, ArpFrameParams, ArpOperation, EtherType, EthernetFrameParams, ParsedIpv4Frame,
+        ParsedPacket, UnknownArpOperation,
     },
     rtl8139::Rtl8139,
     sleep::WakeupList,
     time::MonotonicTime,
+    util::async_mutex::Mutex,
     util::interrupt_guard::InterruptGuarded,
 };
 
@@ -60,7 +70,7 @@ use crate::{
 // naked function + some inline asm, but this seems much more straight forward.
 global_asm!(include_str!("boot.s"), options(att_syntax));
 
-const STATIC_IP: [u8; 4] = [192, 168, 122, 55];
+const STATIC_IP: [u8; 4] = [192, 168, 2, 2];
 
 extern "C" {
     static KERNEL_START: u32;
@@ -120,6 +130,58 @@ fn gen_printers(
     })
 }
 
+// FIXME: Ip address should be strong typed
+type IpAddr = [u8; 4];
+type MacAddr = [u8; 6];
+
+struct ArpReadyFuture<'a> {
+    ip: &'a IpAddr,
+    table: &'a Mutex<HashMap<IpAddr, MacAddr>>,
+}
+
+impl<'a> core::future::Future for ArpReadyFuture<'a> {
+    type Output = MacAddr;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let guard = core::pin::pin!(self.table.lock());
+        let guard = match guard.poll(cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => {
+                return Poll::Pending;
+            }
+        };
+
+        match guard.get(self.ip) {
+            Some(v) => Poll::Ready(*v),
+            None => Poll::Pending,
+        }
+    }
+}
+
+struct ArpTable {
+    table: Mutex<HashMap<IpAddr, MacAddr>>,
+}
+
+impl ArpTable {
+    fn new() -> ArpTable {
+        let table = Mutex::new(HashMap::new());
+        ArpTable { table }
+    }
+
+    async fn write_mac(&self, ip: &IpAddr, mac: &MacAddr) {
+        let mut table = self.table.lock().await;
+        table.insert(*ip, *mac);
+    }
+
+    async fn wait_for(&self, ip: &[u8; 4]) -> [u8; 6] {
+        ArpReadyFuture {
+            ip,
+            table: &self.table,
+        }
+        .await
+    }
+}
+
 #[allow(unused)]
 struct Kernel {
     io_allocator: IoAllocator,
@@ -127,6 +189,7 @@ struct Kernel {
     rtc: Rtc,
     pci: Pci,
     rtl8139: Rtl8139,
+    arp_table: ArpTable,
     serial: Rc<RefCell<Serial>>,
     terminal_writer: Rc<RefCell<TerminalWriter>>,
     monotonic_time: Rc<MonotonicTime>,
@@ -164,11 +227,13 @@ impl Kernel {
         let rtl8139 = Rtl8139::new(&mut pci, interrupt_handlers, false)
             .expect("Failed to initialize rtl8139");
 
+        let arp_table = ArpTable::new();
         Ok(Kernel {
             interrupt_handlers,
             io_allocator,
             rtc,
             pci,
+            arp_table,
             rtl8139,
             serial,
             terminal_writer,
@@ -193,28 +258,85 @@ impl Kernel {
 
         self.rtl8139.log_mac().await;
 
-        info!("Waiting for UDP message for 3 seconds...");
+        let outgoing = async {
+            let mac = self.rtl8139.get_mac();
+            const REMOTE_IP: [u8; 4] = [192, 168, 2, 1];
+            let arp_frame: Vec<u8> = net::generate_arp_request(&REMOTE_IP, &STATIC_IP, &mac);
+            let ethernet_frame = net::generate_ethernet_frame(&EthernetFrameParams {
+                dest_mac: [0xff; 6],
+                source_mac: mac,
+                ether_type: EtherType::Arp,
+                payload: &arp_frame,
+            });
+            self.rtl8139.write(&ethernet_frame).await.unwrap();
+
+            let sleep_fut = sleep::sleep(1.0, &self.monotonic_time, &self.wakeup_list);
+            let sleep_fut = core::pin::pin!(sleep_fut);
+            let arp_lookup = self.arp_table.wait_for(&REMOTE_IP);
+            let arp_lookup = core::pin::pin!(arp_lookup);
+
+            let mac = match futures::future::select(arp_lookup, sleep_fut).await {
+                Either::Left((mac, _)) => mac,
+                Either::Right(_) => {
+                    warn!("ARP lookup for {:?} failed", REMOTE_IP);
+                    return;
+                }
+            };
+
+            info!("Resolved mac address!: {:?}", mac);
+
+            let udp_frame = net::generate_udp_frame(6000, b"hello from inside the os");
+            let ipv4_frame = net::generate_ipv4_frame(
+                &udp_frame,
+                net::Ipv4Protocol::Udp,
+                &STATIC_IP,
+                &REMOTE_IP,
+            );
+            let ethernet_frame = net::generate_ethernet_frame(&EthernetFrameParams {
+                dest_mac: mac,
+                source_mac: self.rtl8139.get_mac(),
+                ether_type: EtherType::Ipv4,
+                payload: &ipv4_frame,
+            });
+
+            self.rtl8139.write(&ethernet_frame).await.unwrap();
+
+            info!("Sleeping for 5 seconds to wait for incoming connections");
+            sleep::sleep(5.0, &self.monotonic_time, &self.wakeup_list).await;
+        };
+
         let recv = async {
-            recv_loop(&self.rtl8139).await;
+            recv_loop(&self.rtl8139, &self.arp_table).await;
         };
         let recv = core::pin::pin!(recv);
 
-        let sleep_fut = sleep::sleep(3.0, &self.monotonic_time, &self.wakeup_list);
-        let sleep_fut = core::pin::pin!(sleep_fut);
-        info!("Current date modified in cmos: {:?}", date);
-        futures::future::select(recv, sleep_fut).await;
+        let outgoing = core::pin::pin!(outgoing);
+        futures::future::select(recv, outgoing).await;
 
         info!("And now we exit/halt");
     }
 }
 
-async fn handle_arp_frame(arp_frame: &ArpFrame<'_>, rtl8139: &Rtl8139, mac: &[u8; 6]) {
+async fn handle_arp_frame(
+    arp_frame: &ArpFrame<'_>,
+    rtl8139: &Rtl8139,
+    mac: &[u8; 6],
+    arp_table: &ArpTable,
+) {
     debug!("Received arp frame: {:?}", arp_frame);
 
     match arp_frame.operation() {
         Ok(ArpOperation::Request) => (),
         Ok(ArpOperation::Reply) => {
-            debug!("Received arp reply, ignoring");
+            let mac = arp_frame
+                .sender_hardware_address()
+                .try_into()
+                .expect("Arp mac address not the right size");
+            let ip = arp_frame
+                .sender_protocol_address()
+                .try_into()
+                .expect("Arp ip address not the right size");
+            arp_table.write_mac(&ip, &mac).await;
             return;
         }
         Err(UnknownArpOperation(v)) => {
@@ -255,8 +377,7 @@ async fn handle_arp_frame(arp_frame: &ArpFrame<'_>, rtl8139: &Rtl8139, mac: &[u8
             .try_into()
             .expect("Invalid length for dest mac"),
         source_mac: *mac,
-        // FIXME: enum with to_int() or something
-        ether_type: 0x0806,
+        ether_type: EtherType::Arp,
         payload: &response,
     });
 
@@ -264,7 +385,7 @@ async fn handle_arp_frame(arp_frame: &ArpFrame<'_>, rtl8139: &Rtl8139, mac: &[u8
 }
 
 // FIXME: Where does this belong?
-async fn handle_packet(packet: Vec<u8>, rtl8139: &Rtl8139, mac: &[u8; 6]) {
+async fn handle_packet(packet: Vec<u8>, rtl8139: &Rtl8139, mac: &[u8; 6], arp_table: &ArpTable) {
     let packet = net::parse_packet(&packet);
 
     let packet = match packet {
@@ -277,7 +398,7 @@ async fn handle_packet(packet: Vec<u8>, rtl8139: &Rtl8139, mac: &[u8; 6]) {
 
     match packet {
         ParsedPacket::Arp(arp_frame) => {
-            handle_arp_frame(&arp_frame, rtl8139, mac).await;
+            handle_arp_frame(&arp_frame, rtl8139, mac, arp_table).await;
         }
         ParsedPacket::Ipv4(ipv4_frame) => {
             let frame = net::parse_ipv4(&ipv4_frame);
@@ -309,7 +430,7 @@ async fn handle_packet(packet: Vec<u8>, rtl8139: &Rtl8139, mac: &[u8; 6]) {
     }
 }
 
-async fn recv_loop(rtl8139: &Rtl8139) {
+async fn recv_loop(rtl8139: &Rtl8139, arp_table: &ArpTable) {
     let mac = rtl8139.get_mac();
 
     loop {
@@ -317,7 +438,7 @@ async fn recv_loop(rtl8139: &Rtl8139) {
         rtl8139
             .read(|packet| {
                 // FIXME: Avoid copying but types are hard
-                handle_packet(packet.to_vec(), rtl8139, &mac)
+                handle_packet(packet.to_vec(), rtl8139, &mac, arp_table)
             })
             .await;
     }

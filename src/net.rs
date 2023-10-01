@@ -2,12 +2,19 @@ use alloc::vec::Vec;
 
 use core::convert::From;
 
-use crate::util::bit_manipulation::GetBits;
+use crate::{util::bit_manipulation::GetBits, IpAddr};
+
+#[derive(Copy, Clone)]
+#[repr(u16)]
+pub enum EtherType {
+    Ipv4 = 0x0800,
+    Arp = 0x0806,
+}
 
 pub struct EthernetFrameParams<'a> {
     pub dest_mac: [u8; 6],
     pub source_mac: [u8; 6],
-    pub ether_type: u16,
+    pub ether_type: EtherType,
     pub payload: &'a [u8],
 }
 
@@ -26,12 +33,13 @@ pub fn generate_ethernet_frame(params: &EthernetFrameParams<'_>) -> Vec<u8> {
 
     ret.extend_from_slice(&params.dest_mac);
     ret.extend_from_slice(&params.source_mac);
-    ret.extend_from_slice(&params.ether_type.to_be_bytes());
+    ret.extend_from_slice(&(params.ether_type as u16).to_be_bytes());
     ret.extend_from_slice(params.payload);
     if ret.len() < MIN_LENGTH_WITHOUT_CRC {
         ret.resize(MIN_LENGTH_WITHOUT_CRC, 0);
     }
-    ret.extend_from_slice(&eth_crc(&ret).to_be_bytes());
+    // FIXME: checksum for some reason backwards?
+    ret.extend_from_slice(&eth_crc(&ret).to_le_bytes());
     ret
 }
 
@@ -285,6 +293,21 @@ pub fn generate_arp_frame(params: &ArpFrameParams) -> Vec<u8> {
     ret
 }
 
+pub fn generate_arp_request(remote_ip: &[u8; 4], local_ip: &[u8; 4], mac: &[u8; 6]) -> Vec<u8> {
+    generate_arp_frame(&ArpFrameParams {
+        // FIXME: Name hardware/protocol type, maybe make defaults
+        hardware_type: 1,
+        protocol_type: 0x0800,
+        hardware_address_length: 6,
+        protocol_address_length: 4,
+        operation: ArpOperation::Request,
+        sender_hardware_address: *mac,
+        sender_protocol_address: *local_ip,
+        target_hardware_address: [0; 6],
+        target_protocol_address: *remote_ip,
+    })
+}
+
 impl core::fmt::Debug for ArpFrame<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         writeln!(f, "htype: {:?}", self.htype())?;
@@ -364,6 +387,61 @@ impl<'a> Ipv4Frame<'a> {
     }
 }
 
+fn calculate_ipv4_checksum(data: &[u8]) -> u16 {
+    assert_eq!(data.len() % 2, 0);
+
+    let mut checksum = 0u16;
+    for slice in data.chunks(2) {
+        // Ones compliment add, maybe should be factored out
+        let val = u16::from_be_bytes(slice.try_into().expect("Slice should be 2 bytes"));
+        let overflow_res;
+        (checksum, overflow_res) = checksum.overflowing_add(val);
+
+        if overflow_res {
+            checksum += 1;
+        }
+    }
+
+    !checksum
+}
+
+pub fn generate_ipv4_frame(
+    payload: &[u8],
+    protocol: Ipv4Protocol,
+    source_ip: &IpAddr,
+    dest_ip: &IpAddr,
+) -> Vec<u8> {
+    // FIXME: capacity?
+    let mut ret: Vec<u8> = Vec::new();
+
+    const HEADER_SIZE: u16 = 20;
+    // Version + IHL
+    ret.push(0x45);
+    // DSCP ECN
+    ret.push(0x0);
+    // FIXME: usize -> u16 truncation
+    ret.extend_from_slice(&(HEADER_SIZE + payload.len() as u16).to_be_bytes());
+    // Identification
+    ret.extend_from_slice(&0u16.to_be_bytes());
+    // Flags + fragment offset
+    ret.extend_from_slice(&0u16.to_be_bytes());
+    // TTL (copied from wireshark incoming packet)
+    ret.push(64);
+    ret.push(protocol.into());
+
+    let checksum_loc = ret.len();
+    ret.extend_from_slice(&0u16.to_be_bytes());
+    ret.extend_from_slice(source_ip);
+    ret.extend_from_slice(dest_ip);
+
+    let checksum = calculate_ipv4_checksum(&ret);
+    ret[checksum_loc..checksum_loc + 2].copy_from_slice(&checksum.to_be_bytes());
+
+    ret.extend_from_slice(payload);
+
+    ret
+}
+
 #[derive(Debug)]
 pub struct InvalidUdpFrame(usize, usize);
 
@@ -396,6 +474,21 @@ impl UdpFrame<'_> {
     pub fn data(&self) -> &[u8] {
         &self.packet[Self::HEADER_LENGTH..self.length() as usize]
     }
+}
+
+pub fn generate_udp_frame(dest_port: u16, payload: &[u8]) -> Vec<u8> {
+    let length: u16 = UdpFrame::HEADER_LENGTH as u16 + payload.len() as u16;
+
+    let mut ret = Vec::with_capacity(length.into());
+
+    const SOURCE_PORT: &[u8] = &0u16.to_be_bytes();
+    ret.extend_from_slice(SOURCE_PORT);
+    ret.extend_from_slice(&dest_port.to_be_bytes());
+    ret.extend_from_slice(&length.to_be_bytes());
+    const CHECKSUM: &[u8] = &0u16.to_be_bytes();
+    ret.extend_from_slice(CHECKSUM);
+    ret.extend_from_slice(payload);
+    ret
 }
 
 fn eth_crc(data: &[u8]) -> u32 {
@@ -465,6 +558,15 @@ pub fn parse_packet(data: &[u8]) -> Result<ParsedPacket, ParsePacketError> {
 pub enum Ipv4Protocol {
     Udp = 0x11,
     Unknown(u8),
+}
+
+impl core::convert::From<Ipv4Protocol> for u8 {
+    fn from(value: Ipv4Protocol) -> Self {
+        match value {
+            Ipv4Protocol::Udp => 0x11,
+            Ipv4Protocol::Unknown(v) => v,
+        }
+    }
 }
 
 pub enum ParsedIpv4Frame<'a> {
