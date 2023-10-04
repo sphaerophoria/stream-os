@@ -469,7 +469,7 @@ async unsafe fn async_main(mut kernel: Kernel) {
         sleep(0.1).await;
     };
 
-    futures::future::select(Box::pin(logger::service(&sleep)), Box::pin(demo_fut)).await;
+    futures::future::select(Box::pin(logger::service()), Box::pin(demo_fut)).await;
 }
 
 #[no_mangle]

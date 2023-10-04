@@ -1,6 +1,9 @@
-use crate::util::{circular_array::CircularArray, interrupt_guard::InterruptGuarded};
+use crate::{
+    future::wakeup_executor,
+    util::{circular_array::CircularArray, interrupt_guard::InterruptGuarded},
+};
 use alloc::{borrow::Cow, string::String};
-use core::future::Future;
+use core::task::Poll;
 use hashbrown::HashMap;
 
 #[allow(unused)]
@@ -109,6 +112,24 @@ impl core::fmt::Display for LogLevel {
     }
 }
 
+struct LogWaiter<'a> {
+    logs: &'a InterruptGuarded<CircularArray<Log, 1024>>,
+}
+
+impl core::future::Future for LogWaiter<'_> {
+    type Output = Log;
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        match self.logs.lock().pop_front() {
+            Some(v) => Poll::Ready(v),
+            None => Poll::Pending,
+        }
+    }
+}
+
 pub struct Logger {
     levels: InterruptGuarded<Option<HashMap<String, LogLevel>>>,
     logs: InterruptGuarded<CircularArray<Log, 1024>>,
@@ -136,20 +157,13 @@ impl Logger {
         if self.logs.lock().push_back(log).is_err() {
             panic!("Dropped log");
         }
+        wakeup_executor();
     }
 
-    pub async fn service<F, Fut>(&self, sleep: F)
-    where
-        Fut: Future<Output = ()>,
-        F: Fn(f32) -> Fut,
-    {
+    pub async fn service(&self) {
         loop {
-            // FIXME: Proper signaling of logs ready
-            while let Some(v) = self.logs.lock().pop_front() {
-                println!("{}", v);
-            }
-
-            sleep(0.06).await;
+            let log = LogWaiter { logs: &self.logs }.await;
+            println!("{}", log);
         }
     }
 }
@@ -158,10 +172,6 @@ pub fn init(log_levels: HashMap<String, LogLevel>) {
     *LOGGER.levels.lock() = Some(log_levels);
 }
 
-pub async fn service<F, Fut>(sleep: F)
-where
-    Fut: Future<Output = ()>,
-    F: Fn(f32) -> Fut,
-{
-    LOGGER.service(sleep).await;
+pub async fn service() {
+    LOGGER.service().await;
 }

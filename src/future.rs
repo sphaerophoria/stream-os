@@ -32,8 +32,16 @@ pub fn execute_fut<F: Future>(mut fut: F) {
 
     let mut context = core::task::Context::from_waker(&waker);
 
-    while fut.as_mut().poll(&mut context).is_pending() {
+    loop {
         SHOULD_POLL.store(false, Ordering::Release);
+
+        if fut.as_mut().poll(&mut context).is_ready() {
+            break;
+        }
+
+        if SHOULD_POLL.load(Ordering::Acquire) {
+            continue;
+        }
 
         while !SHOULD_POLL.load(Ordering::Acquire) {
             unsafe {
