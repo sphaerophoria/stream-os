@@ -19,15 +19,13 @@ pub struct EthernetFrameParams<'a> {
 }
 
 pub fn generate_ethernet_frame(params: &EthernetFrameParams<'_>) -> Vec<u8> {
-    const MIN_LENGTH: usize = 64;
-    const CRC_SIZE: usize = 4;
-    const MIN_LENGTH_WITHOUT_CRC: usize = MIN_LENGTH - CRC_SIZE;
+    // 64, but CRC is appended by ethernet card
+    const MIN_LENGTH: usize = 60;
 
     let length = core::mem::size_of_val(&params.dest_mac)
         + core::mem::size_of_val(&params.source_mac)
         + core::mem::size_of_val(&params.ether_type)
-        + params.payload.len()
-        + 4; // CRC
+        + params.payload.len();
 
     let mut ret = Vec::with_capacity(length);
 
@@ -35,11 +33,9 @@ pub fn generate_ethernet_frame(params: &EthernetFrameParams<'_>) -> Vec<u8> {
     ret.extend_from_slice(&params.source_mac);
     ret.extend_from_slice(&(params.ether_type as u16).to_be_bytes());
     ret.extend_from_slice(params.payload);
-    if ret.len() < MIN_LENGTH_WITHOUT_CRC {
-        ret.resize(MIN_LENGTH_WITHOUT_CRC, 0);
+    if ret.len() < MIN_LENGTH {
+        ret.resize(MIN_LENGTH, 0);
     }
-    // FIXME: checksum for some reason backwards?
-    ret.extend_from_slice(&eth_crc(&ret).to_le_bytes());
     ret
 }
 
@@ -491,36 +487,6 @@ pub fn generate_udp_frame(dest_port: u16, payload: &[u8]) -> Vec<u8> {
     ret
 }
 
-fn eth_crc(data: &[u8]) -> u32 {
-    // Good explanation of CRC theory
-    // http://ross.net/crc/download/crc_v3.txt
-    // Some sample code implementing a simple CRC
-    // https://stackoverflow.com/questions/75948294/purpose-of-refin-and-refout-parameters-in-crc-rocksoft-model
-    //
-    // From experimentation, we found that the crc rust crate used the following parameters to get
-    // the right answer
-    // Algorithm { width: 32, poly: 0x04c11db7, init: 0xffffffff, refin: true, refout: true, xorout: 0xffffffff, check: 0xcbf43926, residue: 0xdebb20e3 };
-    // refin/refout means that we should be doing right shift with a reflected poly, not the normal
-    // left shift. Xorout means we need to xor the final value
-
-    // NOTE: Table lookup is faster, but more complex. In our current world, we are happy to take
-    // the simplicity of the initial algorithm over the speed of the crc tables
-
-    let mut crc = !0u32;
-    let poly = 0x04c11db7u32.reverse_bits();
-    for b in data {
-        crc ^= *b as u32;
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ poly
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    crc ^ !0
-}
-
 #[derive(Debug)]
 pub enum ParsePacketError {
     Ethernet(InvalidEthernetFrame),
@@ -605,12 +571,6 @@ mod test {
         0xc0, 0xa8, 0x7a, 0x37, 0x96, 0x1e, 0x17, 0x70, 0x00, 0x0d, 0x19, 0x8a, 0x74, 0x65, 0x73,
         0x74, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
-
-    create_test!(test_crc, {
-        let crc = eth_crc(b"123456789");
-        test_eq!(crc, 0xcbf43926u32);
-        Ok(())
-    });
 
     create_test!(test_arp_operation_parse, {
         test_eq!(

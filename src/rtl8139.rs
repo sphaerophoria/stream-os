@@ -182,19 +182,57 @@ unsafe fn enable_transmit_receive(base: *mut u8) -> Result<(), ValueNotSet<u8>> 
     }
 }
 
+#[derive(Debug)]
+pub enum SetTransmitConfigError {
+    EnableLoopback(ValueNotSet<u32>),
+    EnableAppendCrc(ValueNotSet<u32>),
+}
+
+unsafe fn set_transmit_config(
+    base: *mut u8,
+    with_loopback: bool,
+) -> Result<(), SetTransmitConfigError> {
+    if with_loopback {
+        enable_loopback(base).map_err(SetTransmitConfigError::EnableLoopback)?;
+    }
+
+    enable_append_crc(base).map_err(SetTransmitConfigError::EnableAppendCrc)?;
+
+    Ok(())
+}
+
 unsafe fn enable_loopback(base: *mut u8) -> Result<(), ValueNotSet<u32>> {
     let transmit_config_reg = base.add(TRANSMIT_CONFIG_OFFSET) as *mut u32;
     let mut config = transmit_config_reg.read_volatile();
     debug!("initial transmission config: {:#x}", config);
 
     config.set_bits(17, 2, 0b11);
-    debug!("written transmission config: {:b}", config >> 17);
+    debug!("written transmission config: {:b}", config);
 
     transmit_config_reg.write_volatile(config);
     let new_val = transmit_config_reg.read_volatile();
-    debug!("read back transmission config: {:b}", config >> 17);
+    debug!("read back transmission config: {:b}", config);
 
-    // FIXME: Return an error and fail to instantiate driver
+    if new_val != config {
+        Err(ValueNotSet {
+            set: config,
+            retreived: new_val,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+unsafe fn enable_append_crc(base: *mut u8) -> Result<(), ValueNotSet<u32>> {
+    let transmit_config_reg = base.add(TRANSMIT_CONFIG_OFFSET) as *mut u32;
+    let mut config = transmit_config_reg.read_volatile();
+    debug!("initial transmission config: {:#x}", config);
+
+    config.set_bit(16, true);
+    transmit_config_reg.write_volatile(config);
+    let new_val = transmit_config_reg.read_volatile();
+    debug!("read back transmission config: {:#x}", config);
+
     if new_val != config {
         Err(ValueNotSet {
             set: config,
@@ -209,9 +247,11 @@ unsafe fn init_receive_configuration(base: *mut u8) -> Result<(), ValueNotSet<u3
     // Setup global receiver configuration
     let global_receive_config_reg = base.add(RECEIVE_CONFIG_OFFSET) as *mut u32;
     let mut global_receive_config = global_receive_config_reg.read_volatile();
-    // Accept every packet that ever existed
+    // Disable receive
     global_receive_config.set_bits(0, 6, 0x00);
+    // Physical match
     global_receive_config.set_bit(1, true);
+    // Multicast
     global_receive_config.set_bit(3, true);
     // Overwrite start of buffer when too much data (WRAP)
     global_receive_config.set_bit(7, true);
@@ -319,7 +359,6 @@ async unsafe fn get_packet(base: *mut u8, receive_buf: &[u8]) -> &[u8] {
     let start_offset = capr.wrapping_add(16);
     // Qemu source says this is offset by 16 bits
     let header = receive_buf.as_ptr().add(start_offset as usize) as *const u16;
-    // Packet includes a 4 byte CRC at the end which we don't want to copy
     let length = header.wrapping_add(1).read_volatile();
 
     debug!("Received header: {:x}", header.read_volatile());
@@ -333,6 +372,7 @@ async unsafe fn get_packet(base: *mut u8, receive_buf: &[u8]) -> &[u8] {
         cbr,
         receive_buf.len()
     );
+
     // NOTE: WRAP bit is important here
     core::slice::from_raw_parts(header.add(2) as *mut u8, length as usize)
 }
@@ -361,7 +401,7 @@ pub enum Rtl8139InitError {
     InitReceiveBuffer(InitReceiveBufferError),
     InitInterrupts(InitInterruptError),
     EnableTransmitReceive(ValueNotSet<u8>),
-    EnableLoopback(ValueNotSet<u32>),
+    SetTransmitConfig(SetTransmitConfigError),
     InitReceiveConfig(ValueNotSet<u32>),
     InitCapr(ValueNotSet<u16>),
 }
@@ -412,9 +452,8 @@ impl Inner {
             enable_transmit_receive(mmap_range.start)
                 .map_err(Rtl8139InitError::EnableTransmitReceive)?;
 
-            if with_loopback {
-                enable_loopback(mmap_range.start).map_err(Rtl8139InitError::EnableLoopback)?;
-            }
+            set_transmit_config(mmap_range.start, with_loopback)
+                .map_err(Rtl8139InitError::SetTransmitConfig)?;
 
             init_receive_configuration(mmap_range.start)
                 .map_err(Rtl8139InitError::InitReceiveConfig)?;
@@ -432,7 +471,7 @@ impl Inner {
     pub async fn write(&mut self, packet: &[u8]) -> Result<(), PacketTooShort> {
         debug!("Writing packet with length: {}", packet.len());
 
-        if packet.len() < 64 {
+        if packet.len() < 60 {
             return Err(PacketTooShort);
         }
 
