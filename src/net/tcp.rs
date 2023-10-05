@@ -11,7 +11,7 @@ use crate::{
     IpAddr,
 };
 
-use alloc::{boxed::Box, rc::Rc, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, rc::Rc, vec::Vec};
 
 use core::{
     future::Future,
@@ -82,7 +82,7 @@ pub struct TcpFlagsParams {
     pub fin: bool,
 }
 
-pub fn generate_tcp_flags(params: &TcpFlagsParams) -> u8 {
+pub fn generate_tcp_flags(params: &TcpFlagsParams) -> TcpFlags {
     let mut ret = 0u8;
 
     ret.set_bit(7, params.cwr);
@@ -94,7 +94,7 @@ pub fn generate_tcp_flags(params: &TcpFlagsParams) -> u8 {
     ret.set_bit(1, params.syn);
     ret.set_bit(0, params.fin);
 
-    ret
+    TcpFlags(ret)
 }
 
 pub struct TcpFrame<'a> {
@@ -192,7 +192,7 @@ impl core::fmt::Debug for TcpFrame<'_> {
     }
 }
 
-pub struct TcpFrameParams<'a> {
+pub struct TcpFrameParams {
     pub source_address: IpAddr,
     pub dest_address: IpAddr,
     pub source_port: u16,
@@ -202,7 +202,7 @@ pub struct TcpFrameParams<'a> {
     pub flags: TcpFlags,
     pub window_size: u16,
     pub urgent_ptr: u16,
-    pub payload: &'a [u8],
+    pub payload: Rc<[u8]>,
 }
 
 pub fn generate_tcp_frame(params: &TcpFrameParams) -> Vec<u8> {
@@ -221,7 +221,7 @@ pub fn generate_tcp_frame(params: &TcpFrameParams) -> Vec<u8> {
     let checksum_idx = ret.len();
     ret.extend_from_slice(&CHECKSUM.to_be_bytes());
     ret.extend_from_slice(&params.urgent_ptr.to_be_bytes());
-    ret.extend_from_slice(params.payload);
+    ret.extend_from_slice(&params.payload);
 
     let mut checksum_frame = Vec::new();
     checksum_frame.extend_from_slice(&params.source_address);
@@ -241,15 +241,20 @@ pub fn generate_tcp_frame(params: &TcpFrameParams) -> Vec<u8> {
     ret
 }
 
-fn generate_tcp_push(tcp_key: &TcpKey, state: &mut ConnectedState, data: &Rc<[u8]>) -> Vec<u8> {
-    let ret = generate_tcp_frame(&TcpFrameParams {
+fn generate_tcp_push(
+    tcp_key: &TcpKey,
+    state: &mut ConnectedState,
+    data: Rc<[u8]>,
+) -> TcpFrameParams {
+    let payload_length = data.len();
+    let ret = TcpFrameParams {
         source_address: tcp_key.local_ip,
         dest_address: tcp_key.remote_ip,
         source_port: tcp_key.local_port,
         dest_port: tcp_key.remote_port,
         seq_num: state.seq_num,
-        ack_num: state.ack_num,
-        flags: TcpFlags(generate_tcp_flags(&TcpFlagsParams {
+        ack_num: state.outgoing_ack_num,
+        flags: generate_tcp_flags(&TcpFlagsParams {
             cwr: false,
             ece: false,
             urg: false,
@@ -258,14 +263,14 @@ fn generate_tcp_push(tcp_key: &TcpKey, state: &mut ConnectedState, data: &Rc<[u8
             rst: false,
             syn: false,
             fin: false,
-        })),
+        }),
         // FIXME: Set this to something sane?
         window_size: 512,
         urgent_ptr: 0,
         payload: data,
-    });
+    };
 
-    state.seq_num += data.len() as u32;
+    state.seq_num += payload_length as u32;
 
     ret
 }
@@ -284,9 +289,20 @@ struct TcpKey {
     local_port: u16,
 }
 
+struct UnackedPacket {
+    #[allow(unused)]
+    timestamp: usize,
+    params: TcpFrameParams,
+}
+
 struct ConnectedState {
-    seq_num: u32,
-    ack_num: u32,
+    seq_num: u32,          // Incoming seq num
+    outgoing_ack_num: u32, // Outgoing ack num
+    incoming_ack_num: u32,
+    window_size: u16,
+    dup_ack_counter: u8,
+    unacknowledged: VecDeque<UnackedPacket>,
+    to_send: VecDeque<Rc<[u8]>>,
     tx: Sender<Vec<u8>>,
     rx: Receiver<Rc<[u8]>>,
 }
@@ -393,7 +409,7 @@ impl Tcp {
                         dest_port: frame.source_port(),
                         source_port: frame.dest_port(),
                         window_size: frame.window_size(),
-                        flags: net::tcp::TcpFlags(net::tcp::generate_tcp_flags(&TcpFlagsParams {
+                        flags: net::tcp::generate_tcp_flags(&TcpFlagsParams {
                             cwr: false,
                             ece: false,
                             urg: false,
@@ -402,9 +418,9 @@ impl Tcp {
                             rst: false,
                             syn: true,
                             fin: false,
-                        })),
+                        }),
                         urgent_ptr: 0,
-                        payload: &[],
+                        payload: Rc::new([]),
                     })
                     .into();
 
@@ -431,6 +447,7 @@ impl Tcp {
                     if flags.syn() {
                         debug!("Resetting connection, unexpected syn");
                         *state = TcpState::Uninit;
+                        drop(tcp_states);
                         return self.handle_frame(frame, source_ip, dest_ip, rng).await;
                     }
 
@@ -476,7 +493,12 @@ impl Tcp {
 
                     *state = TcpState::Connected(ConnectedState {
                         seq_num: *seq_num + 1,
-                        ack_num: *ack_num + frame.payload().len() as u32,
+                        outgoing_ack_num: *ack_num + frame.payload().len() as u32,
+                        incoming_ack_num: frame.ack_num(),
+                        window_size: frame.window_size(),
+                        dup_ack_counter: 0,
+                        unacknowledged: VecDeque::new(),
+                        to_send: VecDeque::new(),
                         tx: tx_in,
                         rx: rx_out,
                     });
@@ -486,26 +508,41 @@ impl Tcp {
                     None
                 }
                 TcpState::Connected(ref mut state) => {
-                    if state.ack_num != frame.seq_num() {
+                    if state.outgoing_ack_num != frame.seq_num() {
                         debug!(
                             "ack num did not match seq num: {} {}",
-                            state.ack_num,
+                            state.outgoing_ack_num,
                             frame.seq_num()
                         );
                         return None;
                     }
 
-                    state.ack_num = frame.seq_num() + frame.payload().len() as u32;
+                    state.outgoing_ack_num = frame.seq_num() + frame.payload().len() as u32;
+                    if frame.ack_num() == state.incoming_ack_num {
+                        state.dup_ack_counter = state.dup_ack_counter.saturating_add(1);
+                    } else {
+                        state.dup_ack_counter = 0;
+                    }
+
+                    state.incoming_ack_num = frame.ack_num();
+
+                    if let Some(unacked_packet) = state.unacknowledged.get(0) {
+                        if unacked_packet.params.seq_num < frame.ack_num() {
+                            state.unacknowledged.pop_front();
+                        }
+                    }
+
+                    state.window_size = frame.window_size();
 
                     let response_frame = net::tcp::generate_tcp_frame(&TcpFrameParams {
                         source_address: *dest_ip,
                         dest_address: *source_ip,
-                        ack_num: state.ack_num,
+                        ack_num: state.outgoing_ack_num,
                         seq_num: state.seq_num,
                         dest_port: frame.source_port(),
                         source_port: frame.dest_port(),
                         window_size: frame.window_size(),
-                        flags: net::tcp::TcpFlags(net::tcp::generate_tcp_flags(&TcpFlagsParams {
+                        flags: net::tcp::generate_tcp_flags(&TcpFlagsParams {
                             cwr: false,
                             ece: false,
                             urg: false,
@@ -514,17 +551,18 @@ impl Tcp {
                             rst: false,
                             syn: false,
                             fin: false,
-                        })),
+                        }),
                         urgent_ptr: 0,
-                        payload: &[],
+                        payload: Rc::new([]),
                     })
                     .into();
 
                     if frame.flags().psh() {
                         state.tx.send(frame.payload().to_vec()).await;
+                        return Some(response_frame);
                     }
 
-                    Some(response_frame)
+                    None
                 }
             }
         })
@@ -558,13 +596,39 @@ impl Future for OutgoingPoller<'_> {
         for (tcp_key, tcp_state) in &mut *guard {
             match tcp_state {
                 TcpState::Connected(connection) => {
-                    let data = match core::pin::pin!(connection.rx.recv()).poll(cx) {
-                        Poll::Ready(v) => v,
-                        Poll::Pending => continue,
+                    if connection.dup_ack_counter >= 2 {
+                        if let Some(packet) = connection.unacknowledged.pop_front() {
+                            connection.seq_num =
+                                packet.params.seq_num + packet.params.payload.len() as u32;
+                            while let Some(packet) = connection.unacknowledged.pop_front() {
+                                connection.to_send.push_back(packet.params.payload);
+                            }
+                            let payload = generate_tcp_frame(&packet.params).into();
+                            let ret = OutgoingTcpPacket {
+                                local_ip: tcp_key.local_ip,
+                                remote_ip: tcp_key.remote_ip,
+                                payload,
+                            };
+                            return Poll::Ready(ret);
+                        }
+                    }
+
+                    //// FIXME: Check window size before sending
+                    //if let Some(unacked_packet) = connection.unacknowledged.back() {
+                    //    unimplemented!();
+                    //}
+
+                    let data = if let Some(data) = connection.to_send.pop_front() {
+                        data
+                    } else if let Poll::Ready(data) = core::pin::pin!(connection.rx.recv()).poll(cx)
+                    {
+                        data
+                    } else {
+                        continue;
                     };
 
                     return Poll::Ready(write_request_to_outgoing_packet(
-                        tcp_key, connection, &data,
+                        tcp_key, connection, self.time, data,
                     ));
                 }
                 TcpState::SynAckSent {
@@ -588,13 +652,21 @@ impl Future for OutgoingPoller<'_> {
 fn write_request_to_outgoing_packet(
     tcp_key: &TcpKey,
     connected_state: &mut ConnectedState,
-    data: &Rc<[u8]>,
+    time: &MonotonicTime,
+    data: Rc<[u8]>,
 ) -> OutgoingTcpPacket {
-    let payload = generate_tcp_push(tcp_key, connected_state, data);
+    // FIXME: Hidden mutation of connected state
+    let params = generate_tcp_push(tcp_key, connected_state, data);
+    let payload = generate_tcp_frame(&params).into();
+    connected_state.unacknowledged.push_back(UnackedPacket {
+        timestamp: time.get(),
+        params,
+    });
+
     OutgoingTcpPacket {
         local_ip: tcp_key.local_ip,
         remote_ip: tcp_key.remote_ip,
-        payload: payload.into(),
+        payload,
     }
 }
 
@@ -611,6 +683,136 @@ mod test {
     use crate::testing::*;
     use crate::MonotonicTime;
     use crate::WakeupList;
+    use alloc::string::{String, ToString};
+
+    struct TcpFixture {
+        time: Rc<MonotonicTime>,
+        tcp: Tcp,
+        rng: Mutex<Rng>,
+    }
+
+    fn gen_fixture() -> TcpFixture {
+        let time = Rc::new(MonotonicTime::new(10.0));
+        let wakeup_list = Rc::new(WakeupList::new());
+        let rng = Mutex::new(Rng::new(0));
+
+        let tcp = Tcp::new(Rc::clone(&time), wakeup_list);
+
+        TcpFixture { time, tcp, rng }
+    }
+
+    struct MockClient {
+        client_ip: IpAddr,
+        server_ip: IpAddr,
+        client_port: u16,
+        server_port: u16,
+        window_size: u16,
+        seq: u32,
+        ack: u32,
+    }
+
+    impl MockClient {
+        fn syn(&mut self) -> Rc<[u8]> {
+            let ret = generate_tcp_frame(&TcpFrameParams {
+                source_address: self.client_ip,
+                dest_address: self.server_ip,
+                source_port: self.client_port,
+                dest_port: self.server_port,
+                seq_num: self.seq,
+                // Syn should always have ack 0 as we have nothing to ack
+                ack_num: 0,
+                flags: generate_tcp_flags(&TcpFlagsParams {
+                    cwr: false,
+                    ece: false,
+                    urg: false,
+                    ack: false,
+                    psh: false,
+                    rst: false,
+                    syn: true,
+                    fin: false,
+                }),
+                window_size: self.window_size,
+                urgent_ptr: 0,
+                payload: Rc::new([]),
+            })
+            .into();
+            self.seq += 1;
+            ret
+        }
+
+        fn ack(&self) -> Rc<[u8]> {
+            generate_tcp_frame(&TcpFrameParams {
+                source_address: self.client_ip,
+                dest_address: self.server_ip,
+                source_port: self.client_port,
+                dest_port: self.server_port,
+                seq_num: self.seq,
+                ack_num: self.ack,
+                flags: generate_tcp_flags(&TcpFlagsParams {
+                    cwr: false,
+                    ece: false,
+                    urg: false,
+                    ack: true,
+                    psh: false,
+                    rst: false,
+                    syn: false,
+                    fin: false,
+                }),
+                window_size: self.window_size,
+                urgent_ptr: 0,
+                payload: Rc::new([]),
+            })
+            .into()
+        }
+
+        async fn handshake(&mut self, fixture: &TcpFixture) -> Result<(), String> {
+            let syn = self.syn();
+
+            let syn_ack = match fixture
+                .tcp
+                .handle_frame(
+                    &TcpFrame::new(&syn),
+                    &self.client_ip,
+                    &self.server_ip,
+                    &fixture.rng,
+                )
+                .await
+            {
+                Some(v) => v,
+                None => {
+                    return Err("No syn ack for syn".into());
+                }
+            };
+
+            self.handle_frame(&syn_ack);
+
+            let ack = self.ack();
+
+            let response = fixture
+                .tcp
+                .handle_frame(
+                    &TcpFrame::new(&ack),
+                    &self.client_ip,
+                    &self.server_ip,
+                    &fixture.rng,
+                )
+                .await;
+
+            test_true!(response.is_none());
+
+            Ok(())
+        }
+
+        fn handle_frame(&mut self, buf: &[u8]) {
+            let frame = TcpFrame::new(&buf);
+            let seq = frame.seq_num();
+            let payload_len = frame.payload().len();
+
+            if self.ack == seq {
+                self.ack = seq + payload_len as u32;
+            }
+        }
+    }
 
     create_test!(test_tcp_frame_parsing, {
         const TCP_SYN: &[u8] = &[
@@ -645,15 +847,14 @@ mod test {
             fin: true,
         });
 
-        let parsed_flags = TcpFlags(flags);
-        test_eq!(parsed_flags.cwr(), true);
-        test_eq!(parsed_flags.ece(), false);
-        test_eq!(parsed_flags.urg(), false);
-        test_eq!(parsed_flags.ack(), true);
-        test_eq!(parsed_flags.psh(), false);
-        test_eq!(parsed_flags.rst(), true);
-        test_eq!(parsed_flags.syn(), true);
-        test_eq!(parsed_flags.fin(), true);
+        test_eq!(flags.cwr(), true);
+        test_eq!(flags.ece(), false);
+        test_eq!(flags.urg(), false);
+        test_eq!(flags.ack(), true);
+        test_eq!(flags.psh(), false);
+        test_eq!(flags.rst(), true);
+        test_eq!(flags.syn(), true);
+        test_eq!(flags.fin(), true);
 
         Ok(())
     });
@@ -665,18 +866,18 @@ mod test {
         const SOURCE_IP: IpAddr = [192, 168, 2, 1];
         const DEST_IP: IpAddr = [192, 168, 2, 2];
 
-        let time = Rc::new(MonotonicTime::new(10.0));
-        let wakeup_list = Rc::new(WakeupList::new());
-        let rng = Mutex::new(Rng::new(0));
+        let fixture = gen_fixture();
 
-        let tcp = Tcp::new(Rc::clone(&time), wakeup_list);
-        let listener = tcp.listen(DEST_IP, 9999).await;
+        let listener = fixture.tcp.listen(DEST_IP, 9999).await;
 
         let frame = TcpFrame::new(TCP_SYN);
-        tcp.handle_frame(&frame, &SOURCE_IP, &DEST_IP, &rng).await;
+        fixture
+            .tcp
+            .handle_frame(&frame, &SOURCE_IP, &DEST_IP, &fixture.rng)
+            .await;
 
         // We should get a syn-ack response from the initial syn
-        if futures::future::poll_immediate(tcp.service())
+        if futures::future::poll_immediate(fixture.tcp.service())
             .await
             .is_some()
         {
@@ -684,9 +885,11 @@ mod test {
         }
 
         // After 2 seconds we should have waited enough to trigger a syn-ack resend
-        time.set_tick((time.tick_freq() * 2.0) as usize);
+        fixture
+            .time
+            .set_tick((fixture.time.tick_freq() * 2.0) as usize);
 
-        let syn_ack = match futures::future::poll_immediate(tcp.service()).await {
+        let syn_ack = match futures::future::poll_immediate(fixture.tcp.service()).await {
             Some(v) => v,
             None => return Err("Syn ack retransmit missing".into()),
         };
@@ -697,7 +900,10 @@ mod test {
         test_true!(syn_ack.flags().ack());
 
         let frame = TcpFrame::new(TCP_ACK);
-        tcp.handle_frame(&frame, &SOURCE_IP, &DEST_IP, &rng).await;
+        fixture
+            .tcp
+            .handle_frame(&frame, &SOURCE_IP, &DEST_IP, &fixture.rng)
+            .await;
 
         if futures::future::poll_immediate(listener.connection())
             .await
@@ -705,6 +911,94 @@ mod test {
         {
             return Err("Connection not ready".into());
         }
+
+        Ok(())
+    });
+
+    create_test!(test_dup_ack_retransmission, {
+        const CLIENT_IP: IpAddr = [192, 168, 2, 1];
+        const SERVER_IP: IpAddr = [192, 168, 2, 2];
+        const CLIENT_PORT: u16 = 1234;
+        const SERVER_PORT: u16 = 5678;
+
+        let fixture = gen_fixture();
+
+        let listener = fixture.tcp.listen(SERVER_IP, SERVER_PORT).await;
+
+        let mut mock_client = MockClient {
+            client_ip: CLIENT_IP,
+            server_ip: SERVER_IP,
+            client_port: CLIENT_PORT,
+            server_port: SERVER_PORT,
+            window_size: 5000,
+            seq: 150,
+            ack: 0,
+        };
+
+        mock_client.handshake(&fixture).await?;
+
+        let connection = futures::future::poll_immediate(listener.connection())
+            .await
+            .ok_or("Connection not ready".to_string())?;
+
+        connection.write(Rc::<str>::from("hello world")).await;
+        connection.write(Rc::<str>::from("hello world 2")).await;
+
+        let frame = futures::future::poll_immediate(fixture.tcp.service())
+            .await
+            .ok_or("tcp service did not return a value".to_string())?;
+
+        mock_client.handle_frame(&frame.payload);
+
+        let frame = TcpFrame::new(&frame.payload);
+        test_eq!(frame.payload(), b"hello world");
+
+        let data1_ack = mock_client.ack();
+
+        let response = fixture
+            .tcp
+            .handle_frame(
+                &TcpFrame::new(&data1_ack),
+                &CLIENT_IP,
+                &SERVER_IP,
+                &fixture.rng,
+            )
+            .await;
+
+        test_true!(response.is_none());
+
+        let frame = futures::future::poll_immediate(fixture.tcp.service())
+            .await
+            .ok_or("tcp service did not return a value".to_string())?;
+
+        let frame = TcpFrame::new(&frame.payload);
+        test_eq!(frame.payload(), b"hello world 2");
+
+        // Intentionally do not inform the mock of the second frame
+
+        // After we've sent first two packets, nothing to do
+        test_true!(futures::future::poll_immediate(fixture.tcp.service())
+            .await
+            .is_none());
+
+        for _ in 0..2 {
+            // ACK first segment 2 more times
+            let response = fixture
+                .tcp
+                .handle_frame(
+                    &TcpFrame::new(&data1_ack),
+                    &CLIENT_IP,
+                    &SERVER_IP,
+                    &fixture.rng,
+                )
+                .await;
+            test_true!(response.is_none());
+        }
+
+        // 3 acks, retransmission please
+        test_true!(futures::future::poll_immediate(fixture.tcp.service())
+            .await
+            .is_some());
 
         Ok(())
     });

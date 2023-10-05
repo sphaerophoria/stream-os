@@ -312,7 +312,6 @@ impl Kernel {
             self.rtl8139.write(&ethernet_frame).await.unwrap();
 
             info!("Sleeping for 5 seconds to wait for incoming connections");
-            sleep::sleep(30.0, &self.monotonic_time, &self.wakeup_list).await;
         };
 
         let echo_tcp = async {
@@ -358,10 +357,12 @@ impl Kernel {
         let outgoing = core::pin::pin!(send_udp);
         let handle_tcp_connection = core::pin::pin!(echo_tcp);
 
-        futures::future::select(
-            futures::future::join_all([recv, handle_tcp_connection, core::pin::pin!(tcp_service)]),
+        futures::future::join_all([
+            recv,
+            handle_tcp_connection,
+            core::pin::pin!(tcp_service),
             outgoing,
-        )
+        ])
         .await;
 
         info!("And now we exit/halt");
