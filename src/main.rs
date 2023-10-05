@@ -4,6 +4,7 @@
 #![feature(abi_x86_interrupt)]
 #![feature(maybe_uninit_uninit_array)]
 #![feature(const_maybe_uninit_uninit_array)]
+#![feature(core_intrinsics)]
 #![no_std]
 #![no_main]
 #![feature(custom_test_frameworks)]
