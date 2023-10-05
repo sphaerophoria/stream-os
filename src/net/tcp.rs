@@ -667,7 +667,7 @@ mod test {
 
         let time = Rc::new(MonotonicTime::new(10.0));
         let wakeup_list = Rc::new(WakeupList::new());
-        let rng = Mutex::new(Rng::new());
+        let rng = Mutex::new(Rng::new(0));
 
         let tcp = Tcp::new(Rc::clone(&time), wakeup_list);
         let listener = tcp.listen(DEST_IP, 9999).await;

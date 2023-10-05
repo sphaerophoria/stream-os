@@ -224,7 +224,7 @@ impl Kernel {
             }
         };
 
-        let rtc = io::rtc::Rtc::new(&mut io_allocator, interrupt_handlers, on_tick)
+        let mut rtc = io::rtc::Rtc::new(&mut io_allocator, interrupt_handlers, on_tick)
             .expect("Failed to construct rtc");
 
         let mut pci = Pci::new(&mut io_allocator).expect("Failed to initialize pci");
@@ -233,7 +233,7 @@ impl Kernel {
             .expect("Failed to initialize rtl8139");
 
         let arp_table = ArpTable::new();
-        let rng = Mutex::new(Rng::new());
+        let rng = Mutex::new(Rng::new(rtc.read().unwrap().seconds as u64));
         let tcp = Tcp::new(Rc::clone(&monotonic_time), Rc::clone(&wakeup_list));
 
         Ok(Kernel {

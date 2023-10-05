@@ -9,11 +9,11 @@ pub struct Rng {
 }
 
 impl Rng {
-    pub fn new() -> Rng {
+    pub fn new(seed: u64) -> Rng {
         let hash_builder = core::hash::BuildHasherDefault::<AHasher>::default();
         let hasher = hash_builder.build_hasher();
         Rng {
-            state: 0u64,
+            state: seed,
             hasher,
         }
     }
