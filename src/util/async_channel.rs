@@ -1,4 +1,3 @@
-#![allow(unused)]
 use crate::util::async_mutex::Mutex;
 
 use alloc::{collections::VecDeque, rc::Rc};

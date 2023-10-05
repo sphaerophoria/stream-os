@@ -57,8 +57,8 @@ use crate::{
     },
     multiboot::MultibootInfo,
     net::{
-        ArpFrame, ArpFrameParams, ArpOperation, EtherType, EthernetFrameParams, ParsedIpv4Frame,
-        ParsedPacket, UnknownArpOperation,
+        tcp::Tcp, ArpFrame, ArpFrameParams, ArpOperation, EtherType, EthernetFrameParams,
+        ParsedIpv4Frame, ParsedPacket, UnknownArpOperation,
     },
     rng::Rng,
     rtl8139::Rtl8139,
@@ -195,6 +195,7 @@ struct Kernel {
     rtl8139: Rtl8139,
     arp_table: ArpTable,
     serial: Rc<RefCell<Serial>>,
+    tcp: Tcp,
     terminal_writer: Rc<RefCell<TerminalWriter>>,
     monotonic_time: Rc<MonotonicTime>,
     wakeup_list: Rc<WakeupList>,
@@ -233,6 +234,7 @@ impl Kernel {
 
         let arp_table = ArpTable::new();
         let rng = Mutex::new(Rng::new());
+        let tcp = Tcp::new(Rc::clone(&monotonic_time), Rc::clone(&wakeup_list));
 
         Ok(Kernel {
             interrupt_handlers,
@@ -243,6 +245,7 @@ impl Kernel {
             arp_table,
             rtl8139,
             serial,
+            tcp,
             terminal_writer,
             monotonic_time,
             wakeup_list,
@@ -265,7 +268,7 @@ impl Kernel {
 
         self.rtl8139.log_mac().await;
 
-        let outgoing = async {
+        let send_udp = async {
             let mac = self.rtl8139.get_mac();
             const REMOTE_IP: [u8; 4] = [192, 168, 2, 1];
             let arp_frame: Vec<u8> = net::generate_arp_request(&REMOTE_IP, &STATIC_IP, &mac);
@@ -309,16 +312,57 @@ impl Kernel {
             self.rtl8139.write(&ethernet_frame).await.unwrap();
 
             info!("Sleeping for 5 seconds to wait for incoming connections");
-            sleep::sleep(5.0, &self.monotonic_time, &self.wakeup_list).await;
+            sleep::sleep(30.0, &self.monotonic_time, &self.wakeup_list).await;
+        };
+
+        let echo_tcp = async {
+            let listener = self.tcp.listen(STATIC_IP, 9999).await;
+            let connection = listener.connection().await;
+            loop {
+                let data = connection.read().await;
+                info!(
+                    "Received TCP data: \"{}\"",
+                    core::str::from_utf8_unchecked(&data)
+                );
+                connection.write(data).await;
+            }
+        };
+
+        let tcp_service = async {
+            loop {
+                let outgoing_data = self.tcp.service().await;
+                let ipv4_frame = net::generate_ipv4_frame(
+                    &outgoing_data.payload,
+                    net::Ipv4Protocol::Tcp,
+                    &outgoing_data.local_ip,
+                    &outgoing_data.remote_ip,
+                );
+
+                // FIXME: Generate arp request if needed?
+                let ethernet_frame = net::generate_ethernet_frame(&EthernetFrameParams {
+                    dest_mac: self.arp_table.wait_for(&outgoing_data.remote_ip).await,
+                    source_mac: self.rtl8139.get_mac(),
+                    ether_type: EtherType::Ipv4,
+                    payload: &ipv4_frame,
+                });
+
+                self.rtl8139.write(&ethernet_frame).await.unwrap();
+            }
         };
 
         let recv = async {
-            recv_loop(&self.rtl8139, &self.arp_table).await;
+            recv_loop(&self.rtl8139, &self.arp_table, &self.tcp, &self.rng).await;
         };
-        let recv = core::pin::pin!(recv);
+        let recv: Pin<&mut dyn core::future::Future<Output = ()>> = core::pin::pin!(recv);
 
-        let outgoing = core::pin::pin!(outgoing);
-        futures::future::select(recv, outgoing).await;
+        let outgoing = core::pin::pin!(send_udp);
+        let handle_tcp_connection = core::pin::pin!(echo_tcp);
+
+        futures::future::select(
+            futures::future::join_all([recv, handle_tcp_connection, core::pin::pin!(tcp_service)]),
+            outgoing,
+        )
+        .await;
 
         info!("And now we exit/halt");
     }
@@ -392,7 +436,14 @@ async fn handle_arp_frame(
 }
 
 // FIXME: Where does this belong?
-async fn handle_packet(packet: Vec<u8>, rtl8139: &Rtl8139, mac: &[u8; 6], arp_table: &ArpTable) {
+async fn handle_packet(
+    packet: Vec<u8>,
+    rtl8139: &Rtl8139,
+    mac: &[u8; 6],
+    arp_table: &ArpTable,
+    tcp: &Tcp,
+    rng: &Mutex<Rng>,
+) {
     let packet = net::parse_packet(&packet);
 
     let packet = match packet {
@@ -403,16 +454,17 @@ async fn handle_packet(packet: Vec<u8>, rtl8139: &Rtl8139, mac: &[u8; 6], arp_ta
         }
     };
 
-    match packet {
+    match packet.inner {
         ParsedPacket::Arp(arp_frame) => {
             handle_arp_frame(&arp_frame, rtl8139, mac, arp_table).await;
         }
         ParsedPacket::Ipv4(ipv4_frame) => {
+            debug!("Received IPV4 frame");
             let frame = net::parse_ipv4(&ipv4_frame);
             match frame {
                 Ok(ParsedIpv4Frame::Udp(udp_frame)) => {
                     unsafe {
-                        info!(
+                        debug!(
                             "Received UDP message: {}",
                             core::str::from_utf8_unchecked(udp_frame.data())
                         );
@@ -421,6 +473,37 @@ async fn handle_packet(packet: Vec<u8>, rtl8139: &Rtl8139, mac: &[u8; 6], arp_ta
                         unsafe {
                             io::exit(0);
                         }
+                    }
+                }
+                Ok(ParsedIpv4Frame::Tcp(tcp_frame)) => {
+                    //if rng.lock().await.normalized() < 0.1 {
+                    //    info!("Dropping packet");
+                    //    return
+                    //}
+                    let response_tcp_frame = tcp
+                        .handle_frame(&tcp_frame, &ipv4_frame.source_ip(), &STATIC_IP, rng)
+                        .await;
+                    if let Some(response_tcp_frame) = response_tcp_frame {
+                        let response_ipv4_frame = net::generate_ipv4_frame(
+                            &response_tcp_frame,
+                            net::Ipv4Protocol::Tcp,
+                            &STATIC_IP,
+                            &ipv4_frame.source_ip(),
+                        );
+
+                        let response_ethernet_frame =
+                            net::generate_ethernet_frame(&EthernetFrameParams {
+                                dest_mac: packet
+                                    .ethernet
+                                    .source_mac()
+                                    .try_into()
+                                    .expect("invalid source mac length"),
+                                source_mac: rtl8139.get_mac(),
+                                ether_type: EtherType::Ipv4,
+                                payload: &response_ipv4_frame,
+                            });
+
+                        rtl8139.write(&response_ethernet_frame).await.unwrap();
                     }
                 }
                 Ok(ParsedIpv4Frame::Unknown(p)) => {
@@ -437,7 +520,7 @@ async fn handle_packet(packet: Vec<u8>, rtl8139: &Rtl8139, mac: &[u8; 6], arp_ta
     }
 }
 
-async fn recv_loop(rtl8139: &Rtl8139, arp_table: &ArpTable) {
+async fn recv_loop(rtl8139: &Rtl8139, arp_table: &ArpTable, tcp: &Tcp, rng: &Mutex<Rng>) {
     let mac = rtl8139.get_mac();
 
     loop {
@@ -445,7 +528,7 @@ async fn recv_loop(rtl8139: &Rtl8139, arp_table: &ArpTable) {
         rtl8139
             .read(|packet| {
                 // FIXME: Avoid copying but types are hard
-                handle_packet(packet.to_vec(), rtl8139, &mac, arp_table)
+                handle_packet(packet.to_vec(), rtl8139, &mac, arp_table, tcp, rng)
             })
             .await;
     }

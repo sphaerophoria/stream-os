@@ -1,4 +1,7 @@
+pub mod tcp;
+
 use alloc::vec::Vec;
+use tcp::TcpFrame;
 
 use core::convert::From;
 
@@ -42,7 +45,7 @@ pub fn generate_ethernet_frame(params: &EthernetFrameParams<'_>) -> Vec<u8> {
 #[derive(Debug)]
 pub struct InvalidEthernetFrame;
 
-struct EthernetFrame<'a> {
+pub struct EthernetFrame<'a> {
     packet: &'a [u8],
 }
 
@@ -62,15 +65,15 @@ impl<'a> EthernetFrame<'a> {
         Ok(frame)
     }
 
-    fn destination_mac(&self) -> &[u8] {
+    pub fn destination_mac(&self) -> &[u8] {
         &self.packet[0..6]
     }
 
-    fn source_mac(&self) -> &[u8] {
+    pub fn source_mac(&self) -> &[u8] {
         &self.packet[6..12]
     }
 
-    fn tag(&self) -> Option<&[u8]> {
+    pub fn tag(&self) -> Option<&[u8]> {
         if self.has_dot1q() {
             Some(&self.packet[12..16])
         } else {
@@ -78,7 +81,7 @@ impl<'a> EthernetFrame<'a> {
         }
     }
 
-    fn ether_type(&self) -> u16 {
+    pub fn ether_type(&self) -> u16 {
         let start = self.ether_type_offset();
         let end = start + 2;
         u16::from_be_bytes(
@@ -88,17 +91,17 @@ impl<'a> EthernetFrame<'a> {
         )
     }
 
-    fn payload_offset(&self) -> usize {
+    pub fn payload_offset(&self) -> usize {
         self.ether_type_offset() + 2
     }
 
-    fn payload(&self) -> &'a [u8] {
+    pub fn payload(&self) -> &'a [u8] {
         let start = self.ether_type_offset() + 2;
         let end = self.packet.len() - 4;
         &self.packet[start..end]
     }
 
-    fn crc(&self) -> u32 {
+    pub fn crc(&self) -> u32 {
         u32::from_be_bytes(
             self.packet[self.packet.len() - 4..]
                 .try_into()
@@ -355,7 +358,10 @@ impl<'a> Ipv4Frame<'a> {
     fn new(packet: &[u8]) -> Result<Ipv4Frame, InvalidIpv4Frame> {
         let frame = Ipv4Frame { packet };
 
-        if packet.is_empty() || frame.length() > packet.len() {
+        if packet.is_empty()
+            || frame.header_length() > packet.len()
+            || frame.total_length() > packet.len()
+        {
             return Err(InvalidIpv4Frame);
         }
 
@@ -366,8 +372,17 @@ impl<'a> Ipv4Frame<'a> {
         self.packet[0].get_bits(0, 4)
     }
 
+    fn total_length(&self) -> usize {
+        u16::from_be_bytes(
+            self.packet[2..4]
+                .try_into()
+                .expect("Invalid length for total ipv4 length"),
+        ) as usize
+    }
+
     fn protocol(&self) -> Ipv4Protocol {
         match self.packet[9] {
+            0x06 => Ipv4Protocol::Tcp,
             0x11 => Ipv4Protocol::Udp,
             v => Ipv4Protocol::Unknown(v),
         }
@@ -375,10 +390,16 @@ impl<'a> Ipv4Frame<'a> {
 
     fn payload(&self) -> &'a [u8] {
         let ipv4_length = self.ihl() * 4;
-        &self.packet[ipv4_length as usize..]
+        &self.packet[ipv4_length as usize..self.total_length()]
     }
 
-    fn length(&self) -> usize {
+    pub fn source_ip(&self) -> IpAddr {
+        self.packet[12..16]
+            .try_into()
+            .expect("Invalid length for ipv4 source ip")
+    }
+
+    fn header_length(&self) -> usize {
         (self.ihl() as usize) * 4
     }
 }
@@ -471,7 +492,6 @@ impl UdpFrame<'_> {
         &self.packet[Self::HEADER_LENGTH..self.length() as usize]
     }
 }
-
 pub fn generate_udp_frame(dest_port: u16, payload: &[u8]) -> Vec<u8> {
     let length: u16 = UdpFrame::HEADER_LENGTH as u16 + payload.len() as u16;
 
@@ -500,7 +520,12 @@ pub enum ParsedPacket<'a> {
     Unknown(u16),
 }
 
-pub fn parse_packet(data: &[u8]) -> Result<ParsedPacket, ParsePacketError> {
+pub struct ParsedEthernetFrame<'a> {
+    pub ethernet: EthernetFrame<'a>,
+    pub inner: ParsedPacket<'a>,
+}
+
+pub fn parse_packet(data: &[u8]) -> Result<ParsedEthernetFrame, ParsePacketError> {
     let frame = EthernetFrame::new(data).map_err(ParsePacketError::Ethernet)?;
 
     let payload = frame.payload();
@@ -516,19 +541,24 @@ pub fn parse_packet(data: &[u8]) -> Result<ParsedPacket, ParsePacketError> {
         t => ParsedPacket::Unknown(t),
     };
 
-    Ok(ret)
+    Ok(ParsedEthernetFrame {
+        ethernet: frame,
+        inner: ret,
+    })
 }
 
 #[derive(Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum Ipv4Protocol {
-    Udp = 0x11,
+    Tcp,
+    Udp,
     Unknown(u8),
 }
 
 impl core::convert::From<Ipv4Protocol> for u8 {
     fn from(value: Ipv4Protocol) -> Self {
         match value {
+            Ipv4Protocol::Tcp => 0x06,
             Ipv4Protocol::Udp => 0x11,
             Ipv4Protocol::Unknown(v) => v,
         }
@@ -537,6 +567,7 @@ impl core::convert::From<Ipv4Protocol> for u8 {
 
 pub enum ParsedIpv4Frame<'a> {
     Udp(UdpFrame<'a>),
+    Tcp(TcpFrame<'a>),
     Unknown(Ipv4Protocol),
 }
 
@@ -547,6 +578,7 @@ pub fn parse_ipv4<'a>(frame: &Ipv4Frame<'a>) -> Result<ParsedIpv4Frame<'a>, Inva
     );
     let ret = match frame.protocol() {
         Ipv4Protocol::Udp => ParsedIpv4Frame::Udp(UdpFrame::new(frame.payload())?),
+        Ipv4Protocol::Tcp => ParsedIpv4Frame::Tcp(TcpFrame::new(frame.payload())),
         p => ParsedIpv4Frame::Unknown(p),
     };
     Ok(ret)
@@ -686,8 +718,6 @@ mod test {
         let ipv4_frame = Ipv4Frame::new(&[0xff]);
         test_err!(ipv4_frame);
 
-        let ipv4_frame = Ipv4Frame::new(&[0x11; 4]);
-        test_ok!(ipv4_frame);
         Ok(())
     });
 
@@ -698,7 +728,7 @@ mod test {
             Ipv4Frame::new(frame.payload()).map_err(|_| "Invalid ipv4 frame".to_string())?;
         test_eq!(frame.ihl(), 5);
         test_eq!(frame.protocol(), Ipv4Protocol::Udp);
-        test_eq!(frame.length(), 20);
+        test_eq!(frame.header_length(), 20);
         Ok(())
     });
 

@@ -18,6 +18,11 @@ impl MonotonicTime {
         last + 1
     }
 
+    #[cfg(test)]
+    pub fn set_tick(&self, val: usize) {
+        self.tick.store(val, Ordering::Release);
+    }
+
     pub fn get(&self) -> usize {
         self.tick.load(Ordering::Acquire)
     }
