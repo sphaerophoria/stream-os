@@ -256,7 +256,7 @@ impl Kernel {
 
         let mut date = self.rtc.read().expect("failed to read date");
         info!("Current date: {:?}", date);
-        date.hours -= 1;
+        date.hours = (date.hours + 1) % 24;
         self.rtc.write(&date).expect("failed to write rtc date");
 
         let date = self.rtc.read().expect("failed to read date");
