@@ -28,6 +28,7 @@ mod io;
 mod libc;
 mod multiboot;
 mod net;
+mod rng;
 mod rtl8139;
 mod sleep;
 mod time;
@@ -58,6 +59,7 @@ use crate::{
         ArpFrame, ArpFrameParams, ArpOperation, EtherType, EthernetFrameParams, ParsedIpv4Frame,
         ParsedPacket, UnknownArpOperation,
     },
+    rng::Rng,
     rtl8139::Rtl8139,
     sleep::WakeupList,
     time::MonotonicTime,
@@ -186,6 +188,7 @@ impl ArpTable {
 struct Kernel {
     io_allocator: IoAllocator,
     interrupt_handlers: &'static InterruptHandlerData,
+    rng: Mutex<Rng>,
     rtc: Rtc,
     pci: Pci,
     rtl8139: Rtl8139,
@@ -228,10 +231,13 @@ impl Kernel {
             .expect("Failed to initialize rtl8139");
 
         let arp_table = ArpTable::new();
+        let rng = Mutex::new(Rng::new());
+
         Ok(Kernel {
             interrupt_handlers,
             io_allocator,
             rtc,
+            rng,
             pci,
             arp_table,
             rtl8139,
