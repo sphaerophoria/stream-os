@@ -525,7 +525,7 @@ async fn recv_loop(rtl8139: &Rtl8139, arp_table: &ArpTable, tcp: &Tcp, rng: &Mut
     let mac = rtl8139.get_mac();
 
     loop {
-        info!("Waiting for a packet");
+        debug!("Waiting for a packet");
         rtl8139
             .read(|packet| {
                 // FIXME: Avoid copying but types are hard
