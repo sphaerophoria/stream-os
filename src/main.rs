@@ -41,7 +41,14 @@ mod util;
 
 use crate::future::Either;
 use acpi::MadtEntry;
-use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
 use multiboot2::Multiboot2;
 use multiprocessing::Apic;
 
@@ -361,15 +368,33 @@ impl Kernel {
         };
 
         let echo_tcp = async {
-            let listener = self.tcp.listen(STATIC_IP, 9999).await;
-            let connection = listener.connection().await;
+            let listener = self.tcp.listen(STATIC_IP, 80).await;
             loop {
+                let connection = listener.connection().await;
                 let data = connection.read().await;
+
                 info!(
                     "Received TCP data: \"{}\"",
                     core::str::from_utf8_unchecked(&data)
                 );
-                connection.write(data).await;
+
+                match handle_http_request(&data) {
+                    Ok(response) => {
+                        connection.write(response.to_string().into_bytes()).await;
+                    }
+                    Err(_) => {
+                        connection
+                            .write(
+                                "HTTP/1.1 500 Internal servrer error\r\n\
+                            Content-Length: 0
+                            \r\n\
+                            \r\n"
+                                    .to_string()
+                                    .into_bytes(),
+                            )
+                            .await;
+                    }
+                }
             }
         };
 
@@ -445,6 +470,75 @@ impl Kernel {
 
         info!("And now we exit/halt");
     }
+}
+
+struct IncompleteHttpRequest;
+
+struct HttpResponse {
+    headers: HashMap<String, String>,
+    body: String,
+}
+
+impl HttpResponse {
+    fn new(body: String, content_type: String) -> HttpResponse {
+        let mut headers = HashMap::new();
+        headers.insert("Content-Length".to_string(), body.len().to_string());
+        headers.insert("Content-Type".to_string(), content_type);
+        headers.insert("Connection".to_string(), "close".into());
+
+        HttpResponse { headers, body }
+    }
+}
+
+impl core::fmt::Display for HttpResponse {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "HTTP/1.1 200 OK\r\n")?;
+        for (key, value) in &self.headers {
+            write!(f, "{}: {}\r\n", key, value)?;
+        }
+        write!(f, "\r\n{}", self.body)?;
+        Ok(())
+    }
+}
+
+fn handle_http_request(data: &[u8]) -> Result<HttpResponse, IncompleteHttpRequest> {
+    let first_line_end = data
+        .windows(2)
+        .position(|d| d == b"\r\n")
+        .ok_or(IncompleteHttpRequest)?;
+
+    let request_line = &data[..first_line_end];
+
+    let uri = request_line
+        .split(|b| *b == b' ')
+        .nth(1)
+        .ok_or(IncompleteHttpRequest)?;
+
+    let mut uri_items = uri.splitn(2, |b| *b == b'?');
+
+    let path = uri_items
+        .next()
+        .expect("Should always get at least 1 element");
+    let params = uri_items.next();
+
+    let ret = match path {
+        b"/" => HttpResponse::new(
+            include_str!("../res/index.html").to_string(),
+            "text/html".into(),
+        ),
+        b"/form" => unsafe {
+            HttpResponse::new(
+                format!(
+                    "Got form request with params: {}",
+                    core::str::from_utf8_unchecked(params.unwrap())
+                ),
+                "text/html".into(),
+            )
+        },
+        _ => HttpResponse::new("Uh oh".to_string(), "text/html".into()),
+    };
+
+    Ok(ret)
 }
 
 async fn handle_arp_frame(
