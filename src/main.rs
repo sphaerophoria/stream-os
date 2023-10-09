@@ -374,28 +374,39 @@ impl Kernel {
             let mut y_vel = 0.06;
             let mut color = [1.0f32; 3];
 
-            let mut draw_circle = |center_x, center_y, rad, color: [f32; 3]| {
-                for y in 0..self.framebuffer.height() {
-                    for x in 0..self.framebuffer.width() {
+            let mut draw_circle = |center_x_norm, center_y_norm, rad_norm, color: [f32; 3]| {
+                let height = self.framebuffer.height() as i32;
+                let width = self.framebuffer.width() as i32;
+                let center_x_px = (center_x_norm * width as f32) as i32;
+                let center_y_px = (center_y_norm * height as f32) as i32;
+                let rad_px = (rad_norm * width as f32) as i32;
+                let rad_px_2 = rad_px * rad_px;
+
+                let fb_color = self.framebuffer.convert_color(color[0], color[1], color[2]);
+                let fb_black = self.framebuffer.convert_color(0.0f32, 0.0f32, 0.0f32);
+
+                for y in 0..height {
+                    for x in 0..width {
                         // (x-off)^2 + (y-off)^2 < rad^2
-                        let x_2 = (x as f32 / self.framebuffer.width() as f32) - center_x;
+                        let x_2 = x - center_x_px;
                         let x_2 = x_2 * x_2;
 
-                        let y_2 = (y as f32 / self.framebuffer.height() as f32) - center_y;
+                        let y_2 = y - center_y_px;
                         let y_2 = y_2 * y_2;
-                        let in_sphere = x_2 + y_2 < rad * rad;
-                        //println!("in_sphere: {}", in_sphere);
+                        let in_sphere = x_2 + y_2 < rad_px_2;
+
                         if in_sphere {
-                            self.framebuffer
-                                .set_pixel(y, x, color[0], color[1], color[2]);
+                            self.framebuffer.set_pixel(y as u32, x as u32, fb_color);
                         } else {
-                            self.framebuffer.set_pixel(y, x, 0_f32, 0_f32, 0_f32);
+                            self.framebuffer.set_pixel(y as u32, x as u32, fb_black);
                         }
                     }
                 }
             };
 
             loop {
+                let start = self.monotonic_time.get();
+
                 x += x_vel;
                 y += y_vel;
 
@@ -414,7 +425,13 @@ impl Kernel {
                 }
                 draw_circle(x, y, rad, color);
 
-                sleep::sleep(DELTA, &self.monotonic_time, &self.wakeup_list).await;
+                let end = self.monotonic_time.get();
+
+                let elapsed_s = (end - start) as f32 / self.monotonic_time.tick_freq();
+                if elapsed_s < DELTA {
+                    let remaining_s = DELTA - elapsed_s;
+                    sleep::sleep(remaining_s, &self.monotonic_time, &self.wakeup_list).await;
+                }
             }
         };
         futures::future::join_all([
