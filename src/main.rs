@@ -25,6 +25,7 @@ mod future;
 mod gdt;
 #[macro_use]
 mod interrupts;
+mod framebuffer;
 mod io;
 mod libc;
 mod multiboot;
@@ -49,6 +50,7 @@ use core::{
 use hashbrown::HashMap;
 
 use crate::{
+    framebuffer::FrameBuffer,
     future::execute_fut,
     interrupts::{InitInterruptError, InterruptHandlerData},
     io::{
@@ -195,6 +197,7 @@ struct Kernel {
     rtl8139: Rtl8139,
     arp_table: ArpTable,
     serial: Rc<RefCell<Serial>>,
+    framebuffer: FrameBuffer,
     tcp: Tcp,
     terminal_writer: Rc<RefCell<TerminalWriter>>,
     monotonic_time: Rc<MonotonicTime>,
@@ -236,6 +239,11 @@ impl Kernel {
         let rng = Mutex::new(Rng::new(rtc.read().unwrap().seconds as u64));
         let tcp = Tcp::new(Rc::clone(&monotonic_time), Rc::clone(&wakeup_list));
 
+        let framebuffer = FrameBuffer::new(
+            (*info)
+                .get_framebuffer_info()
+                .expect("Failed to initialize framebuffer"),
+        );
         Ok(Kernel {
             interrupt_handlers,
             io_allocator,
@@ -246,6 +254,7 @@ impl Kernel {
             rtl8139,
             serial,
             tcp,
+            framebuffer,
             terminal_writer,
             monotonic_time,
             wakeup_list,
@@ -356,6 +365,14 @@ impl Kernel {
 
         let outgoing = core::pin::pin!(send_udp);
         let handle_tcp_connection = core::pin::pin!(echo_tcp);
+
+        for y in 0..self.framebuffer.height() {
+            let r = y as f32 / self.framebuffer.height() as f32;
+            for x in 0..self.framebuffer.width() {
+                let g = x as f32 / self.framebuffer.height() as f32;
+                self.framebuffer.set_pixel(y, x, r, g, 0_f32);
+            }
+        }
 
         futures::future::join_all([
             recv,
