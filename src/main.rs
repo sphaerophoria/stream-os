@@ -366,19 +366,63 @@ impl Kernel {
         let outgoing = core::pin::pin!(send_udp);
         let handle_tcp_connection = core::pin::pin!(echo_tcp);
 
-        for y in 0..self.framebuffer.height() {
-            let r = y as f32 / self.framebuffer.height() as f32;
-            for x in 0..self.framebuffer.width() {
-                let g = x as f32 / self.framebuffer.height() as f32;
-                self.framebuffer.set_pixel(y, x, r, g, 0_f32);
-            }
-        }
+        let drawing = async {
+            const DELTA: f32 = 0.03;
+            let mut x = 0.3;
+            let mut y = 0.5;
+            let mut x_vel = 0.03;
+            let mut y_vel = 0.06;
+            let mut color = [1.0f32; 3];
 
+            let mut draw_circle = |center_x, center_y, rad, color: [f32; 3]| {
+                for y in 0..self.framebuffer.height() {
+                    for x in 0..self.framebuffer.width() {
+                        // (x-off)^2 + (y-off)^2 < rad^2
+                        let x_2 = (x as f32 / self.framebuffer.width() as f32) - center_x;
+                        let x_2 = x_2 * x_2;
+
+                        let y_2 = (y as f32 / self.framebuffer.height() as f32) - center_y;
+                        let y_2 = y_2 * y_2;
+                        let in_sphere = x_2 + y_2 < rad * rad;
+                        //println!("in_sphere: {}", in_sphere);
+                        if in_sphere {
+                            self.framebuffer
+                                .set_pixel(y, x, color[0], color[1], color[2]);
+                        } else {
+                            self.framebuffer.set_pixel(y, x, 0_f32, 0_f32, 0_f32);
+                        }
+                    }
+                }
+            };
+
+            loop {
+                x += x_vel;
+                y += y_vel;
+
+                let rad = 0.05_f32;
+                if x + rad > 1.0 || x - rad < 0.0 {
+                    for c in &mut color {
+                        *c = self.rng.lock().await.normalized();
+                    }
+                    x_vel *= -1.0;
+                }
+                if y + rad > 1.0 || y - rad < 0.0 {
+                    for c in &mut color {
+                        *c = self.rng.lock().await.normalized();
+                    }
+                    y_vel *= -1.0;
+                }
+                draw_circle(x, y, rad, color);
+
+                sleep::sleep(DELTA, &self.monotonic_time, &self.wakeup_list).await;
+            }
+        };
         futures::future::join_all([
             recv,
             handle_tcp_connection,
             core::pin::pin!(tcp_service),
             outgoing,
+            core::pin::pin!(drawing),
         ])
         .await;
 
