@@ -22,6 +22,7 @@ mod logger;
 mod testing;
 mod allocator;
 mod future;
+mod game;
 mod gdt;
 #[macro_use]
 mod interrupts;
@@ -371,91 +372,19 @@ impl Kernel {
         let outgoing = core::pin::pin!(send_udp);
         let handle_tcp_connection = core::pin::pin!(echo_tcp);
 
-        let drawing = async {
-            const DELTA: f32 = 0.03;
-            let mut x = 0.3;
-            let mut y = 0.5;
-            let mut x_vel = 0.03;
-            let mut y_vel = 0.06;
-            let mut color = [1.0f32; 3];
-            let mut pause = false;
-
-            let mut draw_circle = |center_x_norm, center_y_norm, rad_norm, color: [f32; 3]| {
-                let height = self.framebuffer.height() as i32;
-                let width = self.framebuffer.width() as i32;
-                let center_x_px = (center_x_norm * width as f32) as i32;
-                let center_y_px = (center_y_norm * height as f32) as i32;
-                let rad_px = (rad_norm * width as f32) as i32;
-                let rad_px_2 = rad_px * rad_px;
-
-                let fb_color = self.framebuffer.convert_color(color[0], color[1], color[2]);
-                let fb_black = self.framebuffer.convert_color(0.0f32, 0.0f32, 0.0f32);
-
-                for y in 0..height {
-                    for x in 0..width {
-                        // (x-off)^2 + (y-off)^2 < rad^2
-                        let x_2 = x - center_x_px;
-                        let x_2 = x_2 * x_2;
-
-                        let y_2 = y - center_y_px;
-                        let y_2 = y_2 * y_2;
-                        let in_sphere = x_2 + y_2 < rad_px_2;
-
-                        if in_sphere {
-                            self.framebuffer.set_pixel(y as u32, x as u32, fb_color);
-                        } else {
-                            self.framebuffer.set_pixel(y as u32, x as u32, fb_black);
-                        }
-                    }
-                }
-            };
-
-            loop {
-                if let Some(185) = futures::future::poll_immediate(self.ps2.read()).await {
-                    pause = !pause;
-                }
-
-                if pause {
-                    sleep::sleep(DELTA, &self.monotonic_time, &self.wakeup_list).await;
-                    continue;
-                }
-
-                let start = self.monotonic_time.get();
-
-                x += x_vel;
-                y += y_vel;
-
-                let rad = 0.05_f32;
-                if x + rad > 1.0 || x - rad < 0.0 {
-                    for c in &mut color {
-                        *c = self.rng.lock().await.normalized();
-                    }
-                    x_vel *= -1.0;
-                }
-                if y + rad > 1.0 || y - rad < 0.0 {
-                    for c in &mut color {
-                        *c = self.rng.lock().await.normalized();
-                    }
-                    y_vel *= -1.0;
-                }
-                draw_circle(x, y, rad, color);
-
-                let end = self.monotonic_time.get();
-
-                let elapsed_s = (end - start) as f32 / self.monotonic_time.tick_freq();
-                if elapsed_s < DELTA {
-                    let remaining_s = DELTA - elapsed_s;
-                    sleep::sleep(remaining_s, &self.monotonic_time, &self.wakeup_list).await;
-                }
-            }
-        };
+        let mut game = game::Game::new(
+            &mut self.framebuffer,
+            &mut self.ps2,
+            &self.monotonic_time,
+            &self.wakeup_list,
+        );
 
         futures::future::join_all([
             recv,
             handle_tcp_connection,
             core::pin::pin!(tcp_service),
             outgoing,
-            core::pin::pin!(drawing),
+            core::pin::pin!(game.run()),
         ])
         .await;
 
