@@ -54,8 +54,8 @@ use crate::{
     future::execute_fut,
     interrupts::{InitInterruptError, InterruptHandlerData},
     io::{
-        io_allocator::IoAllocator, pci::Pci, rtc::Rtc, serial::Serial, vga::TerminalWriter,
-        PrinterFunction,
+        io_allocator::IoAllocator, pci::Pci, ps2::Ps2Keyboard, rtc::Rtc, serial::Serial,
+        vga::TerminalWriter, PrinterFunction,
     },
     multiboot::MultibootInfo,
     net::{
@@ -194,6 +194,7 @@ struct Kernel {
     rng: Mutex<Rng>,
     rtc: Rtc,
     pci: Pci,
+    ps2: Ps2Keyboard,
     rtl8139: Rtl8139,
     arp_table: ArpTable,
     serial: Rc<RefCell<Serial>>,
@@ -244,12 +245,16 @@ impl Kernel {
                 .get_framebuffer_info()
                 .expect("Failed to initialize framebuffer"),
         );
+
+        let ps2 = Ps2Keyboard::new(&mut io_allocator, interrupt_handlers);
+
         Ok(Kernel {
             interrupt_handlers,
             io_allocator,
             rtc,
             rng,
             pci,
+            ps2,
             arp_table,
             rtl8139,
             serial,
@@ -373,6 +378,7 @@ impl Kernel {
             let mut x_vel = 0.03;
             let mut y_vel = 0.06;
             let mut color = [1.0f32; 3];
+            let mut pause = false;
 
             let mut draw_circle = |center_x_norm, center_y_norm, rad_norm, color: [f32; 3]| {
                 let height = self.framebuffer.height() as i32;
@@ -405,6 +411,15 @@ impl Kernel {
             };
 
             loop {
+                if let Some(185) = futures::future::poll_immediate(self.ps2.read()).await {
+                    pause = !pause;
+                }
+
+                if pause {
+                    sleep::sleep(DELTA, &self.monotonic_time, &self.wakeup_list).await;
+                    continue;
+                }
+
                 let start = self.monotonic_time.get();
 
                 x += x_vel;
@@ -434,6 +449,7 @@ impl Kernel {
                 }
             }
         };
+
         futures::future::join_all([
             recv,
             handle_tcp_connection,

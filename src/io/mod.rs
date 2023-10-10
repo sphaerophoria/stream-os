@@ -6,6 +6,7 @@ use io_allocator::{IoAllocator, IoOffset, IoRange};
 pub mod vga;
 pub mod io_allocator;
 pub mod pci;
+pub mod ps2;
 pub mod rtc;
 pub mod serial;
 
