@@ -1,33 +1,36 @@
 use crate::{
     future::wakeup_executor,
-    util::{circular_array::CircularArray, interrupt_guard::InterruptGuarded},
+    util::{
+        async_mutex::Mutex,
+        lock_free_queue::{self, Receiver, Sender},
+    },
 };
-use alloc::{borrow::Cow, string::String};
-use core::task::Poll;
+use alloc::string::String;
+use core::{cell::UnsafeCell, task::Poll};
 use hashbrown::HashMap;
 
 #[allow(unused)]
 macro_rules! log {
-    ($level: expr, $s: expr) => {
-        if $crate::logger::LOGGER.get_level(module_path!()) <= $level {
-            let log = $crate::logger::Log {
-                file: file!(),
-                line: line!(),
-                level: $level,
-                message: $s.into()
-            };
-            $crate::logger::LOGGER.push_log(log);
-        }
-    };
     ($level: expr, $s: expr $(, $args: expr)*) => {
-        if $crate::logger::LOGGER.get_level(module_path!()) <= $level {
-            let log = $crate::logger::Log {
-                file: file!(),
-                line: line!(),
-                level: $level,
-                message: alloc::format!($s $(, $args)*).into()
+        loop {
+            #[allow(unused_unsafe)]
+            let logger = unsafe {
+                match (*$crate::logger::LOGGER.0.get()).as_mut() {
+                    Some(v) => v,
+                    None =>  break
+                }
             };
-            $crate::logger::LOGGER.push_log(log);
+            if logger.get_level(module_path!()) <= $level {
+                let log = $crate::logger::Log {
+                    file: file!(),
+                    line: line!(),
+                    level: $level,
+                    message: alloc::format!($s $(, $args)*),
+                };
+                logger.push_log(log);
+            }
+
+            break;
         }
     };
 }
@@ -72,13 +75,15 @@ macro_rules! error {
     };
 }
 
-pub static LOGGER: Logger = Logger::new();
+pub static LOGGER: LoggerHolder = LoggerHolder(UnsafeCell::new(None));
+pub struct LoggerHolder(pub UnsafeCell<Option<Logger>>);
+unsafe impl Sync for LoggerHolder {}
 
 pub struct Log {
     pub file: &'static str,
     pub line: u32,
     pub level: LogLevel,
-    pub message: Cow<'static, str>,
+    pub message: String,
 }
 
 impl core::fmt::Display for Log {
@@ -113,7 +118,7 @@ impl core::fmt::Display for LogLevel {
 }
 
 struct LogWaiter<'a> {
-    logs: &'a InterruptGuarded<CircularArray<Log, 1024>>,
+    log_rx: &'a Mutex<Receiver<Log>>,
 }
 
 impl core::future::Future for LogWaiter<'_> {
@@ -121,9 +126,17 @@ impl core::future::Future for LogWaiter<'_> {
 
     fn poll(
         self: core::pin::Pin<&mut Self>,
-        _cx: &mut core::task::Context<'_>,
+        cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
-        match self.logs.lock().pop_front() {
+        let guard = core::pin::pin!(self.log_rx.lock()).poll(cx);
+        let mut guard = match guard {
+            Poll::Ready(v) => v,
+            Poll::Pending => {
+                return Poll::Pending;
+            }
+        };
+
+        match guard.pop() {
             Some(v) => Poll::Ready(v),
             None => Poll::Pending,
         }
@@ -131,30 +144,28 @@ impl core::future::Future for LogWaiter<'_> {
 }
 
 pub struct Logger {
-    levels: InterruptGuarded<Option<HashMap<String, LogLevel>>>,
-    logs: InterruptGuarded<CircularArray<Log, 1024>>,
+    levels: HashMap<String, LogLevel>,
+    log_tx: Sender<Log>,
+    log_rx: Mutex<Receiver<Log>>,
 }
 
 impl Logger {
-    const fn new() -> Self {
+    fn new(levels: HashMap<String, LogLevel>) -> Self {
+        let (log_tx, log_rx) = lock_free_queue::channel(1024);
+        let log_rx = Mutex::new(log_rx);
         Logger {
-            levels: InterruptGuarded::new(None),
-            logs: InterruptGuarded::new(CircularArray::new()),
+            levels,
+            log_tx,
+            log_rx,
         }
     }
 
     pub fn get_level(&self, module: &str) -> LogLevel {
-        *self
-            .levels
-            .lock()
-            .as_ref()
-            .expect("Logger not initialized")
-            .get(module)
-            .unwrap_or(&LogLevel::Info)
+        *self.levels.get(module).unwrap_or(&LogLevel::Info)
     }
 
     pub fn push_log(&self, log: Log) {
-        if self.logs.lock().push_back(log).is_err() {
+        if self.log_tx.push(log).is_err() {
             panic!("Dropped log");
         }
         wakeup_executor();
@@ -162,16 +173,27 @@ impl Logger {
 
     pub async fn service(&self) {
         loop {
-            let log = LogWaiter { logs: &self.logs }.await;
+            let log = LogWaiter {
+                log_rx: &self.log_rx,
+            }
+            .await;
             println!("{}", log);
         }
     }
 }
 
 pub fn init(log_levels: HashMap<String, LogLevel>) {
-    *LOGGER.levels.lock() = Some(log_levels);
+    unsafe {
+        (*LOGGER.0.get()) = Some(Logger::new(log_levels));
+    }
 }
 
 pub async fn service() {
-    LOGGER.service().await;
+    unsafe {
+        (*LOGGER.0.get())
+            .as_mut()
+            .expect("Logger not initialized")
+            .service()
+            .await;
+    }
 }

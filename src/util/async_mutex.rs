@@ -105,6 +105,9 @@ impl core::future::Future for MutexLocker<'_> {
     }
 }
 
+// NOTE: Assuming single threaded os
+unsafe impl<T> Sync for Mutex<T> {}
+
 #[cfg(test)]
 mod test {
     use super::*;

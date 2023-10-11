@@ -73,7 +73,7 @@ mod test {
         })
         .await;
 
-        if let Poll::Ready(_) = recv_poll {
+        if recv_poll.is_ready() {
             return Err("async receiver had data when it shouldn't".into());
         }
         Ok(())

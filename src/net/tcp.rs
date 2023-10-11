@@ -804,7 +804,7 @@ mod test {
         }
 
         fn handle_frame(&mut self, buf: &[u8]) {
-            let frame = TcpFrame::new(&buf);
+            let frame = TcpFrame::new(buf);
             let seq = frame.seq_num();
             let payload_len = frame.payload().len();
 

@@ -120,6 +120,7 @@ unsafe fn interrupt_guarded_init(
         serial: Rc::clone(&serial),
         terminal_writer: Rc::clone(&terminal_writer),
     }));
+
     gdt::init();
 
     let interrupt_handlers = interrupts::init(&mut io_allocator)?;
@@ -579,7 +580,7 @@ async unsafe fn async_main(mut kernel: Kernel) {
         sleep(0.1).await;
     };
 
-    futures::future::select(Box::pin(logger::service()), Box::pin(demo_fut)).await;
+    futures::future::join(Box::pin(logger::service()), Box::pin(demo_fut)).await;
 }
 
 #[no_mangle]
