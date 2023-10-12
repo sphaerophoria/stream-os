@@ -1,5 +1,8 @@
 use alloc::boxed::Box;
-use core::cell::{RefCell, UnsafeCell};
+use core::{
+    cell::{RefCell, UnsafeCell},
+    fmt::Write,
+};
 use io_allocator::{IoAllocator, IoOffset, IoRange};
 
 #[macro_use]
@@ -10,11 +13,9 @@ pub mod ps2;
 pub mod rtc;
 pub mod serial;
 
-pub type PrinterFunction = dyn FnMut(&'_ str);
-
 pub struct Printer {
     #[allow(clippy::type_complexity)]
-    pub inner: UnsafeCell<Option<Box<PrinterFunction>>>,
+    pub inner: UnsafeCell<Option<Box<dyn Write>>>,
 }
 
 impl Printer {
@@ -45,9 +46,9 @@ unsafe impl Sync for ExitPort {}
 
 static EXIT_PORT: ExitPort = ExitPort::new();
 
-pub fn init_stdio(print_fn: Box<PrinterFunction>) {
+pub fn init_stdio(writer: Box<dyn Write>) {
     unsafe {
-        *PRINTER.inner.get() = Some(print_fn);
+        *PRINTER.inner.get() = Some(writer);
     }
 }
 

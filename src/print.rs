@@ -4,11 +4,7 @@ macro_rules! print {
         unsafe {
             let printer = &mut *crate::io::PRINTER.inner.get();
             if let Some(printer) = printer.as_mut() {
-                if let Some(s) = format_args!($($arg)*).as_str() {
-                    printer(s);
-                } else {
-                    printer(&alloc::format!($($arg)*));
-                }
+                let _ = core::fmt::write(&mut **printer, format_args!($($arg)*));
             }
         }
     }

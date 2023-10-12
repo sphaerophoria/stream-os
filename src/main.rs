@@ -43,7 +43,6 @@ use futures::future::Either;
 use core::{
     arch::global_asm,
     cell::RefCell,
-    fmt::Write,
     panic::PanicInfo,
     pin::Pin,
     task::{Context, Poll},
@@ -56,7 +55,7 @@ use crate::{
     interrupts::{InitInterruptError, InterruptHandlerData},
     io::{
         io_allocator::IoAllocator, pci::Pci, ps2::Ps2Keyboard, rtc::Rtc, serial::Serial,
-        vga::TerminalWriter, PrinterFunction,
+        vga::TerminalWriter,
     },
     multiboot::MultibootInfo,
     net::{
@@ -104,10 +103,23 @@ unsafe fn interrupt_guarded_init(
         Serial::new(&mut io_allocator).expect("Failed to initialize serial"),
     ));
 
-    io::init_stdio(gen_printers(
-        Rc::clone(&serial),
-        Rc::clone(&terminal_writer),
-    ));
+    struct SerialWriter {
+        serial: Rc<RefCell<Serial>>,
+        terminal_writer: Rc<RefCell<TerminalWriter>>,
+    }
+
+    impl core::fmt::Write for SerialWriter {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let _ = self.terminal_writer.borrow_mut().write_str(s);
+            self.serial.borrow_mut().write_str(s);
+            Ok(())
+        }
+    }
+
+    io::init_stdio(Box::new(SerialWriter {
+        serial: Rc::clone(&serial),
+        terminal_writer: Rc::clone(&terminal_writer),
+    }));
     gdt::init();
 
     let interrupt_handlers = interrupts::init(&mut io_allocator)?;
@@ -117,22 +129,6 @@ unsafe fn interrupt_guarded_init(
         terminal_writer,
         serial,
         interrupt_handlers,
-    })
-}
-
-#[allow(clippy::await_holding_refcell_ref)]
-fn gen_printers(
-    serial: Rc<RefCell<Serial>>,
-    terminal_writer: Rc<RefCell<TerminalWriter>>,
-) -> Box<PrinterFunction> {
-    Box::new(move |s| {
-        let serial = Rc::clone(&serial);
-        let terminal_writer = Rc::clone(&terminal_writer);
-        terminal_writer
-            .borrow_mut()
-            .write_str(s)
-            .expect("Failed to write to terminal");
-        serial.borrow_mut().write_str(s);
     })
 }
 
