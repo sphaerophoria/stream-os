@@ -2,13 +2,14 @@ use core::{
     cell::UnsafeCell,
     marker::PhantomData,
     ops::{Deref, DerefMut},
+    sync::atomic::{AtomicUsize, Ordering},
     task::Poll,
 };
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct MutexGuard<'a, T> {
     inner: &'a mut T,
-    count: &'a mut usize,
+    count: &'a AtomicUsize,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -28,14 +29,13 @@ impl<T> DerefMut for MutexGuard<'_, T> {
 
 impl<T> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
-        *self.count -= 1;
-        assert_eq!(*self.count, 0);
+        self.count.store(0, Ordering::Release);
     }
 }
 
 pub struct Mutex<T> {
     inner: UnsafeCell<T>,
-    count: UnsafeCell<usize>,
+    count: AtomicUsize,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -48,37 +48,43 @@ impl<T> Mutex<T> {
         }
     }
 
-    fn acquire(&self) -> MutexGuard<'_, T> {
+    fn acquire(&self) -> Option<MutexGuard<'_, T>> {
         unsafe {
-            *self.count.get() += 1;
-            assert_eq!(*self.count.get(), 1);
-
-            MutexGuard {
-                inner: &mut *self.inner.get(),
-                count: &mut *self.count.get(),
-                _not_send: PhantomData,
+            let count = self.count.load(Ordering::Acquire);
+            if count != 0 {
+                return None;
             }
+
+            if self
+                .count
+                .compare_exchange_weak(count, count + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return None;
+            };
+
+            // Should be guaranteed that only 1 thread made it through
+
+            Some(MutexGuard {
+                inner: &mut *self.inner.get(),
+                count: &self.count,
+                _not_send: PhantomData,
+            })
         }
     }
 
     pub async fn lock(&self) -> MutexGuard<'_, T> {
-        unsafe {
-            MutexLocker {
-                count: &*self.count.get(),
+        loop {
+            MutexLocker { count: &self.count }.await;
+
+            if let Some(guard) = self.acquire() {
+                return guard;
             }
-            .await;
-            self.acquire()
         }
     }
 
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
-        unsafe {
-            if is_lock_free(*self.count.get()) {
-                Some(self.acquire())
-            } else {
-                None
-            }
-        }
+        self.acquire()
     }
 }
 
@@ -87,7 +93,7 @@ fn is_lock_free(count: usize) -> bool {
 }
 
 struct MutexLocker<'a> {
-    count: &'a usize,
+    count: &'a AtomicUsize,
 }
 
 impl core::future::Future for MutexLocker<'_> {
@@ -97,7 +103,8 @@ impl core::future::Future for MutexLocker<'_> {
         self: core::pin::Pin<&mut Self>,
         _cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
-        if is_lock_free(*self.count) {
+        let count = self.count.load(Ordering::Acquire);
+        if is_lock_free(count) {
             Poll::Ready(())
         } else {
             Poll::Pending
@@ -105,7 +112,6 @@ impl core::future::Future for MutexLocker<'_> {
     }
 }
 
-// NOTE: Assuming single threaded os
 unsafe impl<T> Sync for Mutex<T> {}
 
 #[cfg(test)]
