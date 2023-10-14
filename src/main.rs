@@ -64,7 +64,7 @@ use crate::{
     },
     rng::Rng,
     rtl8139::Rtl8139,
-    sleep::WakeupList,
+    sleep::{WakeupRequester, WakeupService},
     time::MonotonicTime,
     util::async_mutex::Mutex,
     util::interrupt_guard::InterruptGuarded,
@@ -198,7 +198,8 @@ struct Kernel {
     tcp: Tcp,
     terminal_writer: Rc<RefCell<TerminalWriter>>,
     monotonic_time: Rc<MonotonicTime>,
-    wakeup_list: Rc<WakeupList>,
+    wakeup_requester: WakeupRequester,
+    wakeup_service: WakeupService,
 }
 
 impl Kernel {
@@ -211,16 +212,16 @@ impl Kernel {
         } = interrupt_guarded_init(info)?;
 
         let monotonic_time = Rc::new(MonotonicTime::new(Rtc::tick_freq()));
-        let wakeup_list = Rc::new(WakeupList::new());
+        let (wakeup_requester, wakeup_service, interrupt_wakeups) =
+            sleep::construct_wakeup_handlers();
         io::init_late(&mut io_allocator);
 
         let on_tick = {
             let monotonic_time = Rc::clone(&monotonic_time);
-            let wakeup_list = Rc::clone(&wakeup_list);
 
             move || {
                 let tick = monotonic_time.increment();
-                wakeup_list.wakeup_if_neccessary(tick);
+                interrupt_wakeups.wakeup_if_neccessary(tick);
             }
         };
 
@@ -234,7 +235,7 @@ impl Kernel {
 
         let arp_table = ArpTable::new();
         let rng = Mutex::new(Rng::new(rtc.read().unwrap().seconds as u64));
-        let tcp = Tcp::new(Rc::clone(&monotonic_time), Rc::clone(&wakeup_list));
+        let tcp = Tcp::new(Rc::clone(&monotonic_time), wakeup_requester.clone());
 
         let framebuffer = FrameBuffer::new(
             (*info)
@@ -258,7 +259,8 @@ impl Kernel {
             framebuffer,
             terminal_writer,
             monotonic_time,
-            wakeup_list,
+            wakeup_service,
+            wakeup_requester,
         })
     }
 
@@ -290,7 +292,7 @@ impl Kernel {
             });
             self.rtl8139.write(&ethernet_frame).await.unwrap();
 
-            let sleep_fut = sleep::sleep(1.0, &self.monotonic_time, &self.wakeup_list);
+            let sleep_fut = sleep::sleep(1.0, &self.monotonic_time, &self.wakeup_requester);
             let sleep_fut = core::pin::pin!(sleep_fut);
             let arp_lookup = self.arp_table.wait_for(&REMOTE_IP);
             let arp_lookup = core::pin::pin!(arp_lookup);
@@ -371,7 +373,7 @@ impl Kernel {
             &mut self.framebuffer,
             &mut self.ps2,
             &self.monotonic_time,
-            &self.wakeup_list,
+            &self.wakeup_requester,
         );
 
         futures::future::join_all([
@@ -380,6 +382,7 @@ impl Kernel {
             core::pin::pin!(tcp_service),
             outgoing,
             core::pin::pin!(game.run()),
+            core::pin::pin!(self.wakeup_service.service()),
         ])
         .await;
 
@@ -556,11 +559,11 @@ async fn recv_loop(rtl8139: &Rtl8139, arp_table: &ArpTable, tcp: &Tcp, rng: &Mut
 async unsafe fn async_main(mut kernel: Kernel) {
     let sleep = {
         let monotonic_time = Rc::clone(&kernel.monotonic_time);
-        let wakeup_list = Rc::clone(&kernel.wakeup_list);
+        let wakeup_requester = kernel.wakeup_requester.clone();
         move |t| {
             let monotonic_time = Rc::clone(&monotonic_time);
-            let wakeup_list = Rc::clone(&wakeup_list);
-            Box::pin(async move { sleep::sleep(t, &monotonic_time, &wakeup_list).await })
+            let wakeup_requester = wakeup_requester.clone();
+            Box::pin(async move { sleep::sleep(t, &monotonic_time, &wakeup_requester).await })
         }
     };
 
@@ -568,8 +571,35 @@ async unsafe fn async_main(mut kernel: Kernel) {
         #[cfg(test)]
         {
             test_main();
-            // FIXME: Sleep for a little longer to give the logger time to print the last message
-            sleep(0.1).await;
+
+            let start = kernel.monotonic_time.get();
+            // t * t/s
+            let end = (start as f32 + 0.1 / kernel.monotonic_time.tick_freq()) as usize;
+
+            struct BusyWait {
+                monotonic_time: Rc<MonotonicTime>,
+                end: usize,
+            }
+
+            impl core::future::Future for BusyWait {
+                type Output = ();
+
+                fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                    if self.monotonic_time.get() < self.end {
+                        future::wakeup_executor();
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(())
+                    }
+                }
+            }
+
+            BusyWait {
+                monotonic_time: Rc::clone(&kernel.monotonic_time),
+                end,
+            }
+            .await;
+
             io::exit(0);
         }
 

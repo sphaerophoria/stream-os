@@ -113,6 +113,7 @@ impl core::future::Future for MutexLocker<'_> {
 }
 
 unsafe impl<T> Sync for Mutex<T> {}
+unsafe impl<T> Send for Mutex<T> {}
 
 #[cfg(test)]
 mod test {

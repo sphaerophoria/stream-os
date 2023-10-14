@@ -1,7 +1,7 @@
 use crate::{
     net::{self, Ipv4Protocol},
     rng::Rng,
-    sleep::WakeupList,
+    sleep::WakeupRequester,
     time::MonotonicTime,
     util::{
         async_channel::{self, Receiver, Sender},
@@ -350,11 +350,11 @@ pub struct Tcp {
     listeners: Mutex<HashMap<TcpListenerKey, Sender<TcpConnection>>>,
     tcp_states: Mutex<HashMap<TcpKey, TcpState>>,
     time: Rc<MonotonicTime>,
-    wakeup_list: Rc<WakeupList>,
+    wakeup_list: WakeupRequester,
 }
 
 impl Tcp {
-    pub fn new(time: Rc<MonotonicTime>, wakeup_list: Rc<WakeupList>) -> Tcp {
+    pub fn new(time: Rc<MonotonicTime>, wakeup_list: WakeupRequester) -> Tcp {
         Tcp {
             listeners: Mutex::new(Default::default()),
             tcp_states: Mutex::new(Default::default()),
@@ -431,7 +431,7 @@ impl Tcp {
                     };
 
                     let timeout = (self.time.get() as f32 + 1.0 * self.time.tick_freq()) as usize;
-                    self.wakeup_list.register_wakeup_time(timeout);
+                    self.wakeup_list.register_wakeup_time(timeout).await;
                     *state = TcpState::SynAckSent {
                         seq_num,
                         ack_num,
@@ -682,7 +682,6 @@ mod test {
     use super::*;
     use crate::testing::*;
     use crate::MonotonicTime;
-    use crate::WakeupList;
     use alloc::string::{String, ToString};
 
     struct TcpFixture {
@@ -693,7 +692,7 @@ mod test {
 
     fn gen_fixture() -> TcpFixture {
         let time = Rc::new(MonotonicTime::new(10.0));
-        let wakeup_list = Rc::new(WakeupList::new());
+        let (wakeup_list, _, _) = crate::sleep::construct_wakeup_handlers();
         let rng = Mutex::new(Rng::new(0));
 
         let tcp = Tcp::new(Rc::clone(&time), wakeup_list);

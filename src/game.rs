@@ -1,7 +1,7 @@
 use crate::{
     framebuffer::FrameBuffer,
     io::ps2::Ps2Keyboard,
-    sleep::{self, WakeupList},
+    sleep::{self, WakeupRequester},
     time::MonotonicTime,
 };
 
@@ -87,7 +87,7 @@ pub struct Game<'a> {
     framebuffer: &'a mut FrameBuffer,
     ps2: &'a mut Ps2Keyboard,
     monotonic_time: &'a MonotonicTime,
-    wakeup_list: &'a WakeupList,
+    wakeup_list: &'a WakeupRequester,
 }
 
 impl<'a> Game<'a> {
@@ -95,7 +95,7 @@ impl<'a> Game<'a> {
         framebuffer: &'a mut FrameBuffer,
         ps2: &'a mut Ps2Keyboard,
         monotonic_time: &'a MonotonicTime,
-        wakeup_list: &'a WakeupList,
+        wakeup_list: &'a WakeupRequester,
     ) -> Game<'a> {
         let state = State {
             pause: false,
