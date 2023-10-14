@@ -4,12 +4,18 @@ use crate::{
     util::interrupt_guard::InterruptGuarded,
 };
 use alloc::boxed::Box;
-use core::{arch::asm, cell::RefCell};
+use core::{
+    arch::asm,
+    cell::{RefCell, UnsafeCell},
+};
 use hashbrown::HashMap;
 
 static INTERRUPT_TABLE: InterruptTable = InterruptTable::new();
 static INTERRUPT_HANDLER_DATA: InterruptHandlerData = InterruptHandlerData::new();
-static ISRS: InterruptGuarded<[[u8; 21]; 255]> = InterruptGuarded::new([[0; 21]; 255]);
+static ISRS: Isrs = Isrs(UnsafeCell::new([[0; 21]; 255]));
+
+struct Isrs(UnsafeCell<[[u8; 21]; 255]>);
+unsafe impl Sync for Isrs {}
 
 const PIC_COMMAND_OFFSET: IoOffset = IoOffset::new(0);
 const PIC_DATA_OFFSET: IoOffset = IoOffset::new(1);
@@ -355,18 +361,21 @@ pub fn init(
     pic_disable_interrupts(&mut pic_io).map_err(InitInterruptError::DisableInterrupts)?;
 
     for i in 0..255 {
-        ISRS.lock()[i] = generate_interrupt_stub(i as u8);
-        let descriptor = GateDescriptor::new(GateDescriptorNewArgs {
-            #[allow(clippy::fn_to_numeric_cast)]
-            offset: ISRS.lock()[i].as_ptr() as u32,
-            segment_selector: 0x08,
-            gate_type: 0b1111,
-            dpl: 0,
-            p: true,
-        });
+        unsafe {
+            (*ISRS.0.get())[i] = generate_interrupt_stub(i as u8);
 
-        let mut table = INTERRUPT_TABLE.inner.borrow_mut();
-        table[i] = descriptor;
+            let descriptor = GateDescriptor::new(GateDescriptorNewArgs {
+                #[allow(clippy::fn_to_numeric_cast)]
+                offset: (*ISRS.0.get())[i].as_ptr() as u32,
+                segment_selector: 0x08,
+                gate_type: 0b1111,
+                dpl: 0,
+                p: true,
+            });
+
+            let mut table = INTERRUPT_TABLE.inner.borrow_mut();
+            table[i] = descriptor;
+        }
     }
 
     let table = INTERRUPT_TABLE.inner.borrow_mut();
