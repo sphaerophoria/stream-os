@@ -85,7 +85,7 @@ extern "C" {
 struct EarlyInitHandles {
     io_allocator: IoAllocator,
     terminal_writer: Rc<RefCell<TerminalWriter>>,
-    serial: Rc<RefCell<Serial>>,
+    serial: Rc<Serial>,
     interrupt_handlers: &'static InterruptHandlerData,
 }
 
@@ -99,19 +99,17 @@ unsafe fn interrupt_guarded_init(
     logger::init(Default::default());
     let mut io_allocator = io::io_allocator::IoAllocator::new();
     let terminal_writer = Rc::new(RefCell::new(TerminalWriter::new()));
-    let serial = Rc::new(RefCell::new(
-        Serial::new(&mut io_allocator).expect("Failed to initialize serial"),
-    ));
+    let serial = Rc::new(Serial::new(&mut io_allocator).expect("Failed to initialize serial"));
 
     struct SerialWriter {
-        serial: Rc<RefCell<Serial>>,
+        serial: Rc<Serial>,
         terminal_writer: Rc<RefCell<TerminalWriter>>,
     }
 
     impl core::fmt::Write for SerialWriter {
         fn write_str(&mut self, s: &str) -> core::fmt::Result {
             let _ = self.terminal_writer.borrow_mut().write_str(s);
-            self.serial.borrow_mut().write_str(s);
+            self.serial.write_str(s);
             Ok(())
         }
     }
@@ -195,7 +193,7 @@ struct Kernel {
     ps2: Ps2Keyboard,
     rtl8139: Rtl8139,
     arp_table: ArpTable,
-    serial: Rc<RefCell<Serial>>,
+    serial: Rc<Serial>,
     framebuffer: FrameBuffer,
     tcp: Tcp,
     terminal_writer: Rc<RefCell<TerminalWriter>>,

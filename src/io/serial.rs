@@ -1,5 +1,7 @@
 use crate::io::io_allocator::{IoAllocator, IoOffset, IoRange, OffsetOutOfRange};
 
+use core::cell::UnsafeCell;
+
 const BASE_ADDR: u16 = 0x3f8;
 const DATA_OFFSET: IoOffset = IoOffset::new(0);
 const ENABLE_INTERRUPT_OFFSET: IoOffset = IoOffset::new(1);
@@ -21,7 +23,7 @@ pub enum SerialInitError {
 pub struct WriteError(OffsetOutOfRange);
 
 pub struct Serial {
-    serial_io: IoRange,
+    serial_io: UnsafeCell<IoRange>,
 }
 
 impl Serial {
@@ -56,20 +58,24 @@ impl Serial {
         serial_io
             .write_u8(MODEM_CONTROL_OFFSET, 0x0F)
             .map_err(WriteFailed)?;
-        Ok(Serial { serial_io })
+        Ok(Serial {
+            serial_io: UnsafeCell::new(serial_io),
+        })
     }
 
-    fn write_byte(&mut self, a: u8) -> Result<(), WriteError> {
-        while !is_transmit_ready(&mut self.serial_io) {}
+    fn write_byte(&self, a: u8) -> Result<(), WriteError> {
+        unsafe {
+            while !is_transmit_ready(&mut *self.serial_io.get()) {}
 
-        self.serial_io
-            .write_u8(DATA_OFFSET, a)
-            .map_err(WriteError)?;
+            (*self.serial_io.get())
+                .write_u8(DATA_OFFSET, a)
+                .map_err(WriteError)?;
+        }
 
         Ok(())
     }
 
-    pub fn write_str(&mut self, s: &str) {
+    pub fn write_str(&self, s: &str) {
         for b in s.as_bytes() {
             self.write_byte(*b).expect("failed to write to serial");
         }
