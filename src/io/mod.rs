@@ -1,7 +1,8 @@
 use alloc::boxed::Box;
 use core::{
-    cell::{RefCell, UnsafeCell},
+    cell::UnsafeCell,
     fmt::Write,
+    sync::atomic::{AtomicPtr, Ordering},
 };
 use io_allocator::{IoAllocator, IoOffset, IoRange};
 
@@ -30,21 +31,7 @@ impl Printer {
 unsafe impl Sync for Printer {}
 pub static PRINTER: Printer = Printer::new();
 
-struct ExitPort {
-    port: RefCell<Option<IoRange>>,
-}
-
-impl ExitPort {
-    const fn new() -> ExitPort {
-        ExitPort {
-            port: RefCell::new(None),
-        }
-    }
-}
-// RefCell is not sync, but we only have one thread...
-unsafe impl Sync for ExitPort {}
-
-static EXIT_PORT: ExitPort = ExitPort::new();
+static EXIT_PORT: AtomicPtr<IoRange> = AtomicPtr::new(core::ptr::null_mut());
 
 pub fn init_stdio(writer: Box<dyn Write>) {
     unsafe {
@@ -54,18 +41,22 @@ pub fn init_stdio(writer: Box<dyn Write>) {
 
 pub fn init_late(io_allocator: &mut IoAllocator) {
     const ISA_DEBUG_EXIT_PORT_NUM: u16 = 0xf4;
-    let mut port = EXIT_PORT.port.borrow_mut();
-    *port = Some(
+    let port = Box::new(
         io_allocator
             .request_io_range(ISA_DEBUG_EXIT_PORT_NUM, 1)
             .expect("Failed to get exit port"),
-    )
+    );
+
+    EXIT_PORT.store(Box::leak(port), Ordering::Relaxed);
 }
 
 pub unsafe fn exit(code: u8) {
-    let mut port = EXIT_PORT.port.borrow_mut();
-    port.as_mut()
-        .expect("exit port not initialized")
+    let port = EXIT_PORT.load(Ordering::Relaxed);
+    if port.is_null() {
+        return;
+    }
+
+    (*port)
         .write_u8(IoOffset::new(0), code)
         .expect("failed to write exit port");
 }
