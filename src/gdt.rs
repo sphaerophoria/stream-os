@@ -1,9 +1,5 @@
 use crate::util::bit_manipulation::{GetBits, SetBits};
-use alloc::vec::Vec;
 use core::arch::asm;
-use core::cell::RefCell;
-
-static GDT_ENTRIES: GdtTable = GdtTable::new();
 
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
@@ -55,29 +51,6 @@ impl GdtSegment {
         data.get_bits(52, 4) as u8
     }
 }
-
-struct GdtTable {
-    inner: RefCell<Vec<GdtSegment>>,
-}
-
-impl GdtTable {
-    const fn new() -> GdtTable {
-        GdtTable {
-            inner: RefCell::new(Vec::new()),
-        }
-    }
-}
-
-impl core::ops::Deref for GdtTable {
-    type Target = RefCell<Vec<GdtSegment>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-// Single threaded os
-unsafe impl Sync for GdtTable {}
 
 #[repr(C, packed)]
 struct Gdt {
@@ -171,11 +144,10 @@ pub unsafe fn init() {
     debug!("Initial gdt");
     debug_print_gdt();
 
-    let mut entries = GDT_ENTRIES.borrow_mut();
-    *entries = get_gdt_vals().to_vec();
-    let entry_ptr: *const GdtSegment = entries.as_ptr();
+    let entries = get_gdt_vals().to_vec().leak() as &[GdtSegment];
+    let entry_ptr = entries.as_ptr();
 
-    let limit = entries.len() * core::mem::size_of::<GdtSegment>() - 1;
+    let limit = core::mem::size_of_val(entries) - 1;
     let gdt = Gdt {
         limit: limit as u16,
         base: entry_ptr as u32,
