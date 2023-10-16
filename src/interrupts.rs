@@ -4,14 +4,10 @@ use crate::{
     util::interrupt_guard::InterruptGuarded,
 };
 use alloc::{boxed::Box, vec::Vec};
-use core::{arch::asm, cell::UnsafeCell};
+use core::arch::asm;
 use hashbrown::HashMap;
 
 static INTERRUPT_HANDLER_DATA: InterruptHandlerData = InterruptHandlerData::new();
-static ISRS: Isrs = Isrs(UnsafeCell::new([[0; 21]; 255]));
-
-struct Isrs(UnsafeCell<[[u8; 21]; 255]>);
-unsafe impl Sync for Isrs {}
 
 const PIC_COMMAND_OFFSET: IoOffset = IoOffset::new(0);
 const PIC_DATA_OFFSET: IoOffset = IoOffset::new(1);
@@ -343,24 +339,24 @@ pub fn init(
     pic_disable_interrupts(&mut pic_io).map_err(InitInterruptError::DisableInterrupts)?;
 
     let mut table = Vec::with_capacity(255);
+    let mut isrs = Vec::with_capacity(255);
     for i in 0..255 {
-        unsafe {
-            (*ISRS.0.get())[i] = generate_interrupt_stub(i as u8);
+        isrs.push(generate_interrupt_stub(i as u8));
 
-            let descriptor = GateDescriptor::new(GateDescriptorNewArgs {
-                #[allow(clippy::fn_to_numeric_cast)]
-                offset: (*ISRS.0.get())[i].as_ptr() as u32,
-                segment_selector: 0x08,
-                gate_type: 0b1111,
-                dpl: 0,
-                p: true,
-            });
+        let descriptor = GateDescriptor::new(GateDescriptorNewArgs {
+            #[allow(clippy::fn_to_numeric_cast)]
+            offset: isrs[i].as_ptr() as u32,
+            segment_selector: 0x08,
+            gate_type: 0b1111,
+            dpl: 0,
+            p: true,
+        });
 
-            table.push(descriptor);
-        }
+        table.push(descriptor);
     }
 
     let table = table.leak();
+    let _ = isrs.leak();
     let table_ptr: *const GateDescriptor = table.as_ptr();
 
     let idt = Idt {
