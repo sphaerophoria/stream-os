@@ -120,11 +120,11 @@ pub enum InitInterruptError {
 #[no_mangle]
 extern "C" fn generic_interrupt_handler(interrupt_number: u8) {
     let ret = (|| -> Result<(), InterruptHandlerError> {
-        let handlers = INTERRUPT_HANDLER_DATA.handlers.lock();
+        let mut handlers = INTERRUPT_HANDLER_DATA.handlers.lock();
         let f = match handlers
-            .as_ref()
+            .as_mut()
             .ok_or(InterruptHandlerError::NotInitialized)?
-            .get(&interrupt_number)
+            .get_mut(&interrupt_number)
         {
             Some(f) => f,
             None => {
@@ -197,7 +197,7 @@ struct PicIo {
 
 pub struct InterruptHandlerData {
     #[allow(clippy::type_complexity)]
-    handlers: InterruptGuarded<Option<HashMap<u8, Box<dyn Fn()>>>>,
+    handlers: InterruptGuarded<Option<HashMap<u8, Box<dyn FnMut()>>>>,
     pic_io: InterruptGuarded<Option<PicIo>>,
 }
 
@@ -214,7 +214,7 @@ impl InterruptHandlerData {
         *self.pic_io.lock() = Some(pic_io);
     }
 
-    pub fn register<F: Fn() + 'static>(
+    pub fn register<F: FnMut() + 'static>(
         &self,
         irq_id: IrqId,
         f: F,

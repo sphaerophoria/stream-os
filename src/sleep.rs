@@ -1,12 +1,13 @@
 use crate::{
-    future::wakeup_executor, time::MonotonicTime, util::async_mutex::Mutex,
-    util::interrupt_guard::InterruptGuarded,
+    time::MonotonicTime,
+    util::async_mutex::Mutex,
+    util::{atomic_cell::AtomicCell, interrupt_guard::InterruptGuarded},
 };
 
 use core::{
     future::Future,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 use alloc::{
@@ -29,12 +30,16 @@ impl WakeupRequester {
 
 struct TimeWaiter<'a> {
     posted_wakeup_times: &'a Arc<Mutex<VecDeque<usize>>>,
+    waker: &'a AtomicCell<Waker>,
 }
 
 impl core::future::Future for TimeWaiter<'_> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let waker = cx.waker();
+        self.waker.store(waker.clone());
+
         let pinned = core::pin::pin!(self.posted_wakeup_times.lock());
         let times = match pinned.poll(cx) {
             Poll::Ready(v) => v,
@@ -53,6 +58,7 @@ impl core::future::Future for TimeWaiter<'_> {
 pub struct WakeupService {
     posted_wakeup_times: Arc<Mutex<VecDeque<usize>>>,
     interrupt_visible_wakeup_times: Arc<InterruptGuarded<BTreeSet<usize>>>,
+    waker: Arc<AtomicCell<Waker>>,
 }
 
 impl WakeupService {
@@ -60,6 +66,7 @@ impl WakeupService {
         loop {
             TimeWaiter {
                 posted_wakeup_times: &self.posted_wakeup_times,
+                waker: &self.waker,
             }
             .await;
             let mut wakeup_times = self.posted_wakeup_times.lock().await;
@@ -75,10 +82,11 @@ impl WakeupService {
 // Checks wakeups in interrupt handler
 pub struct InterruptWakeupList {
     wakeup_times: Arc<InterruptGuarded<BTreeSet<usize>>>,
+    waker: Arc<AtomicCell<Waker>>,
 }
 
 impl InterruptWakeupList {
-    pub fn wakeup_if_neccessary(&self, time: usize) {
+    pub fn wakeup_if_neccessary(&mut self, time: usize) {
         let mut wakeup_times = self.wakeup_times.lock();
 
         let mut last_idx = 0;
@@ -94,7 +102,9 @@ impl InterruptWakeupList {
         }
 
         if last_idx > 0 {
-            wakeup_executor();
+            if let Some(waker) = self.waker.get() {
+                waker.wake_by_ref()
+            }
         }
     }
 }
@@ -107,13 +117,17 @@ pub fn construct_wakeup_handlers() -> (WakeupRequester, WakeupService, Interrupt
         posted_wakeup_times: Arc::clone(&posted_wakeup_times),
     };
 
+    let waker = Arc::new(AtomicCell::new());
+
     let handler = WakeupService {
         posted_wakeup_times,
         interrupt_visible_wakeup_times: Arc::clone(&interrupt_visible_wakeup_itimes),
+        waker: Arc::clone(&waker),
     };
 
     let interrupt_handler = InterruptWakeupList {
         wakeup_times: interrupt_visible_wakeup_itimes,
+        waker,
     };
 
     (requester, handler, interrupt_handler)

@@ -50,7 +50,3 @@ pub fn execute_fut<F: Future>(mut fut: F) {
         }
     }
 }
-
-pub fn wakeup_executor() {
-    SHOULD_POLL.store(true, Ordering::Release);
-}

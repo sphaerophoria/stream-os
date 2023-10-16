@@ -1,12 +1,13 @@
-use crate::{
-    future::wakeup_executor,
-    util::{
-        async_mutex::Mutex,
-        lock_free_queue::{self, Receiver, Sender},
-    },
+use crate::util::{
+    async_mutex::Mutex,
+    atomic_cell::AtomicCell,
+    lock_free_queue::{self, Receiver, Sender},
 };
 use alloc::string::String;
-use core::{cell::UnsafeCell, task::Poll};
+use core::{
+    cell::UnsafeCell,
+    task::{Poll, Waker},
+};
 use hashbrown::HashMap;
 
 #[allow(unused)]
@@ -119,6 +120,7 @@ impl core::fmt::Display for LogLevel {
 
 struct LogWaiter<'a> {
     log_rx: &'a Mutex<Receiver<Log>>,
+    waker: &'a AtomicCell<Waker>,
 }
 
 impl core::future::Future for LogWaiter<'_> {
@@ -128,6 +130,8 @@ impl core::future::Future for LogWaiter<'_> {
         self: core::pin::Pin<&mut Self>,
         cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
+        self.waker.store(cx.waker().clone());
+
         let guard = core::pin::pin!(self.log_rx.lock()).poll(cx);
         let mut guard = match guard {
             Poll::Ready(v) => v,
@@ -147,16 +151,19 @@ pub struct Logger {
     levels: HashMap<String, LogLevel>,
     log_tx: Sender<Log>,
     log_rx: Mutex<Receiver<Log>>,
+    waker: AtomicCell<Waker>,
 }
 
 impl Logger {
     fn new(levels: HashMap<String, LogLevel>) -> Self {
         let (log_tx, log_rx) = lock_free_queue::channel(1024);
         let log_rx = Mutex::new(log_rx);
+        let waker = AtomicCell::new();
         Logger {
             levels,
             log_tx,
             log_rx,
+            waker,
         }
     }
 
@@ -168,13 +175,17 @@ impl Logger {
         if self.log_tx.push(log).is_err() {
             panic!("Dropped log");
         }
-        wakeup_executor();
+
+        if let Some(waker) = self.waker.get() {
+            waker.wake_by_ref();
+        }
     }
 
     pub async fn service(&self) {
         loop {
             let log = LogWaiter {
                 log_rx: &self.log_rx,
+                waker: &self.waker,
             }
             .await;
             println!("{}", log);

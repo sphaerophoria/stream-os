@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 use core::{
     cell::UnsafeCell,
     ops::{Deref, DerefMut},
@@ -47,11 +45,11 @@ impl<T> SpinLock<T> {
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         while self
             .available
-            .compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed)
+            .compare_exchange_weak(true, false, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
         {}
 
-        assert!(!self.available.load(Ordering::SeqCst));
+        assert!(!self.available.load(Ordering::Acquire));
 
         unsafe {
             SpinLockGuard {
@@ -63,3 +61,4 @@ impl<T> SpinLock<T> {
 }
 
 unsafe impl<T> Sync for SpinLock<T> {}
+unsafe impl<T: Send> Send for SpinLock<T> {}

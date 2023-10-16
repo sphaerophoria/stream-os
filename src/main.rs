@@ -212,7 +212,7 @@ impl Kernel {
         } = interrupt_guarded_init(info)?;
 
         let monotonic_time = Rc::new(MonotonicTime::new(Rtc::tick_freq()));
-        let (wakeup_requester, wakeup_service, interrupt_wakeups) =
+        let (wakeup_requester, wakeup_service, mut interrupt_wakeups) =
             sleep::construct_wakeup_handlers();
         io::init_late(&mut io_allocator);
 
@@ -383,6 +383,7 @@ impl Kernel {
             outgoing,
             core::pin::pin!(game.run()),
             core::pin::pin!(self.wakeup_service.service()),
+            core::pin::pin!(self.rtl8139.service()),
         ])
         .await;
 
@@ -584,9 +585,9 @@ async unsafe fn async_main(mut kernel: Kernel) {
             impl core::future::Future for BusyWait {
                 type Output = ();
 
-                fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                     if self.monotonic_time.get() < self.end {
-                        future::wakeup_executor();
+                        cx.waker().wake_by_ref();
                         Poll::Pending
                     } else {
                         Poll::Ready(())

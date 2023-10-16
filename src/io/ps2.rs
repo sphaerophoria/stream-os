@@ -1,16 +1,21 @@
 use crate::{
-    future::wakeup_executor,
     interrupts::{InterruptHandlerData, IrqId},
     io::io_allocator::{IoAllocator, IoOffset, IoRange},
     util::{
+        atomic_cell::AtomicCell,
         bit_manipulation::{GetBits, SetBits},
         interrupt_guard::InterruptGuarded,
     },
 };
 
+use core::task::Waker;
+
+use alloc::sync::Arc;
+
 pub struct Ps2Keyboard {
     data: IoRange,
     command: IoRange,
+    waker: Arc<AtomicCell<Waker>>,
 }
 
 impl Ps2Keyboard {
@@ -31,17 +36,31 @@ impl Ps2Keyboard {
         enable_ps2(&mut command);
         reset_devices(&mut command, &mut data);
 
+        let waker: Arc<AtomicCell<Waker>> = Arc::new(AtomicCell::new());
+
         interrupt_handlers
-            .register(IrqId::Pic1(1), wakeup_executor)
+            .register(IrqId::Pic1(1), {
+                let waker = Arc::clone(&waker);
+                move || {
+                    if let Some(waker) = waker.get() {
+                        waker.wake_by_ref();
+                    }
+                }
+            })
             .unwrap();
 
         // FIXME: run initialization steps
-        Ps2Keyboard { data, command }
+        Ps2Keyboard {
+            data,
+            command,
+            waker,
+        }
     }
 
     pub async fn read(&mut self) -> u8 {
         PollReadFut {
             status: &mut self.command,
+            waker: &self.waker,
         }
         .await;
         self.data.read_u8(IoOffset::new(0)).unwrap()
@@ -50,6 +69,7 @@ impl Ps2Keyboard {
 
 struct PollReadFut<'a> {
     status: &'a mut IoRange,
+    waker: &'a AtomicCell<Waker>,
 }
 
 impl core::future::Future for PollReadFut<'_> {
@@ -57,8 +77,9 @@ impl core::future::Future for PollReadFut<'_> {
 
     fn poll(
         mut self: core::pin::Pin<&mut Self>,
-        _cx: &mut core::task::Context<'_>,
+        cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
+        self.waker.store(cx.waker().clone());
         let status = self.status.read_u8(IoOffset::new(0)).unwrap();
         if status.get_bit(0) {
             core::task::Poll::Ready(())

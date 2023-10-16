@@ -145,10 +145,10 @@ pub struct Rtc {
 }
 
 impl Rtc {
-    pub fn new<F: Fn() + 'static>(
+    pub fn new<F: FnMut() + 'static>(
         io_allocator: &mut IoAllocator,
         interrupt_handlers: &InterruptHandlerData,
-        on_tick: F,
+        mut on_tick: F,
     ) -> Result<Rtc, RtcInitError> {
         let interrupt_guard = InterruptGuarded::new(());
         let interrupt_guard = interrupt_guard.lock();

@@ -1,16 +1,22 @@
-use core::task::Poll;
-
 use crate::{
-    future::wakeup_executor,
     interrupts::{InterruptHandlerData, InterruptHandlerRegisterError, IrqId},
     io::pci::{GeneralPciDevice, InvalidHeaderError, Pci, PciDevice},
     util::{
         async_mutex::Mutex,
+        atomic_cell::AtomicCell,
         bit_manipulation::{GetBits, SetBits},
+        spinlock::SpinLock,
     },
 };
 
-use alloc::{boxed::Box, vec};
+use hashbrown::HashMap;
+
+use alloc::{boxed::Box, sync::Arc, vec};
+use core::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll, Waker},
+};
 
 const COMMAND_REGISTER_OFFSET: usize = 0x37;
 const RBSTART_OFFSET: usize = 0x30;
@@ -152,13 +158,16 @@ unsafe fn init_interrupts(
     pci: &mut Pci,
     rtl_device: &mut GeneralPciDevice,
     interrupt_handlers: &InterruptHandlerData,
+    service_waker: Arc<AtomicCell<Waker>>,
 ) -> Result<(), InitInterruptError> {
     let irq_id = get_irq_id(pci, rtl_device).map_err(InitInterruptError::InvalidIrq)?;
 
     interrupt_handlers
         .register(irq_id, move || unsafe {
             clear_interrupt(base);
-            wakeup_executor();
+            if let Some(waker) = service_waker.get() {
+                waker.wake_by_ref();
+            }
         })
         .map_err(InitInterruptError::Register)?;
 
@@ -284,17 +293,22 @@ unsafe fn init_capr(base: *mut u8) -> Result<(), ValueNotSet<u16>> {
     }
 }
 
-struct TranmissionWaiter {
+struct TransmissionWaiter {
     transmit_status_reg: *mut u32,
+    id: usize,
+    waker_list: Arc<SpinLock<HashMap<usize, Waker>>>,
 }
 
-impl core::future::Future for TranmissionWaiter {
+impl core::future::Future for TransmissionWaiter {
     type Output = ();
 
     fn poll(
         self: core::pin::Pin<&mut Self>,
-        _cx: &mut core::task::Context<'_>,
+        cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
+        let waker = cx.waker().clone();
+        self.waker_list.lock().insert(self.id, waker);
+
         unsafe {
             let status = self.transmit_status_reg.read_volatile();
             let own = status.get_bit(13);
@@ -308,10 +322,18 @@ impl core::future::Future for TranmissionWaiter {
     }
 }
 
+impl Drop for TransmissionWaiter {
+    fn drop(&mut self) {
+        self.waker_list.lock().remove(&self.id);
+    }
+}
+
 async unsafe fn transmit_data_and_wait(
     transmit_data_ptr: *mut u32,
     transmit_status_reg: *mut u32,
     data: &[u8],
+    future_id: usize,
+    waker_list: Arc<SpinLock<HashMap<usize, Waker>>>,
 ) {
     transmit_data_ptr.write_volatile(data.as_ptr() as u32);
 
@@ -322,8 +344,10 @@ async unsafe fn transmit_data_and_wait(
     status.set_bit(13, false);
     transmit_status_reg.write_volatile(status);
 
-    let f = TranmissionWaiter {
+    let f = TransmissionWaiter {
         transmit_status_reg,
+        id: future_id,
+        waker_list,
     };
     f.await;
 }
@@ -331,6 +355,8 @@ async unsafe fn transmit_data_and_wait(
 struct ReceiverWaiter {
     capr_reg: *mut u16,
     cbr_reg: *mut u16,
+    id: usize,
+    waker_list: Arc<SpinLock<HashMap<usize, Waker>>>,
 }
 
 impl core::future::Future for ReceiverWaiter {
@@ -338,8 +364,11 @@ impl core::future::Future for ReceiverWaiter {
 
     fn poll(
         self: core::pin::Pin<&mut Self>,
-        _cx: &mut core::task::Context<'_>,
+        cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
+        let waker = cx.waker().clone();
+        self.waker_list.lock().insert(self.id, waker);
+
         unsafe {
             if self.capr_reg.read_volatile().wrapping_add(16) == self.cbr_reg.read_volatile() {
                 Poll::Pending
@@ -350,7 +379,13 @@ impl core::future::Future for ReceiverWaiter {
     }
 }
 
-async unsafe fn get_packet(base: *mut u8, receive_buf: &[u8]) -> &[u8] {
+impl Drop for ReceiverWaiter {
+    fn drop(&mut self) {
+        self.waker_list.lock().remove(&self.id);
+    }
+}
+
+unsafe fn get_packet(base: *mut u8, receive_buf: &[u8]) -> &[u8] {
     // header 16 bit
     // length 16 bit
     // packet
@@ -413,6 +448,8 @@ struct Inner {
     base: *mut u8,
     transmit_idx: u8,
     receive_buf: Box<[u8]>,
+    future_id: usize,
+    waker_list: Arc<SpinLock<HashMap<usize, Waker>>>,
 }
 
 impl Inner {
@@ -420,6 +457,8 @@ impl Inner {
         pci: &mut Pci,
         interrupt_handlers: &InterruptHandlerData,
         with_loopback: bool,
+        waker_list: Arc<SpinLock<HashMap<usize, Waker>>>,
+        service_waker: Arc<AtomicCell<Waker>>,
     ) -> Result<Inner, Rtl8139InitError> {
         let device = pci
             .find_device(0x10ec, 0x8139)
@@ -443,12 +482,19 @@ impl Inner {
 
         // Required for the card to write to memory
         rtl_device.enable_bus_mastering(pci);
+
         unsafe {
             reset_device(mmap_range.start);
             let receive_buf = init_receive_buffer(mmap_range.start)
                 .map_err(Rtl8139InitError::InitReceiveBuffer)?;
-            init_interrupts(mmap_range.start, pci, &mut rtl_device, interrupt_handlers)
-                .map_err(Rtl8139InitError::InitInterrupts)?;
+            init_interrupts(
+                mmap_range.start,
+                pci,
+                &mut rtl_device,
+                interrupt_handlers,
+                Arc::clone(&service_waker),
+            )
+            .map_err(Rtl8139InitError::InitInterrupts)?;
             enable_transmit_receive(mmap_range.start)
                 .map_err(Rtl8139InitError::EnableTransmitReceive)?;
 
@@ -464,6 +510,8 @@ impl Inner {
                 base: mmap_range.start,
                 transmit_idx: 0,
                 receive_buf,
+                future_id: 0,
+                waker_list,
             })
         }
     }
@@ -481,7 +529,16 @@ impl Inner {
             let status_offset = TRANSMIT_STATUS_OFFSET + extra_offset;
             let data_ptr = self.base.add(data_offset) as *mut u32;
             let status_ptr = self.base.add(status_offset) as *mut u32;
-            transmit_data_and_wait(data_ptr, status_ptr, packet).await;
+            let future_id = self.future_id;
+            self.future_id += 1;
+            transmit_data_and_wait(
+                data_ptr,
+                status_ptr,
+                packet,
+                future_id,
+                Arc::clone(&self.waker_list),
+            )
+            .await;
             self.transmit_idx = (self.transmit_idx + 1) % 4;
         }
 
@@ -493,7 +550,7 @@ impl Inner {
         F: Fn(&[u8]) -> Fut,
         Fut: core::future::Future<Output = ()>,
     {
-        let data = unsafe { get_packet(self.base, &self.receive_buf).await };
+        let data = unsafe { get_packet(self.base, &self.receive_buf) };
         let fut = on_read(data);
         unsafe {
             increment_capr(self.base, &self.receive_buf);
@@ -522,6 +579,8 @@ impl Inner {
 
 pub struct Rtl8139 {
     inner: Mutex<Inner>,
+    waker_list: Arc<SpinLock<HashMap<usize, Waker>>>,
+    service_waker: Arc<AtomicCell<Waker>>,
 }
 
 impl Rtl8139 {
@@ -530,8 +589,21 @@ impl Rtl8139 {
         interrupt_handlers: &InterruptHandlerData,
         with_loopback: bool,
     ) -> Result<Rtl8139, Rtl8139InitError> {
-        let inner = Mutex::new(Inner::new(pci, interrupt_handlers, with_loopback)?);
-        Ok(Rtl8139 { inner })
+        let service_waker = Arc::new(AtomicCell::new());
+        let waker_list = Arc::new(SpinLock::new(HashMap::new()));
+
+        let inner = Mutex::new(Inner::new(
+            pci,
+            interrupt_handlers,
+            with_loopback,
+            Arc::clone(&waker_list),
+            Arc::clone(&service_waker),
+        )?);
+        Ok(Rtl8139 {
+            inner,
+            waker_list,
+            service_waker,
+        })
     }
 
     pub async fn write(&self, packet: &[u8]) -> Result<(), PacketTooShort> {
@@ -550,8 +622,21 @@ impl Rtl8139 {
             let cbr_reg = base.add(CBR_OFFSET) as *mut u16;
 
             let fut = loop {
-                ReceiverWaiter { capr_reg, cbr_reg }.await;
-                //sleep(1.0).await;
+                let (id, waker_list) = {
+                    let mut inner = self.inner.lock().await;
+                    let id = inner.future_id;
+                    inner.future_id += 1;
+                    let waker_list = Arc::clone(&inner.waker_list);
+                    (id, waker_list)
+                };
+
+                ReceiverWaiter {
+                    capr_reg,
+                    cbr_reg,
+                    id,
+                    waker_list,
+                }
+                .await;
                 if let Some(mut v) = self.inner.try_lock() {
                     let fut = v.read(on_read).await;
                     break fut;
@@ -559,6 +644,36 @@ impl Rtl8139 {
             };
             fut.await;
         }
+    }
+
+    pub async fn service(&self) {
+        struct Service<'a> {
+            service_waker: &'a AtomicCell<Waker>,
+            waker_list: &'a SpinLock<HashMap<usize, Waker>>,
+        }
+
+        impl Future for Service<'_> {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                self.service_waker.store(cx.waker().clone());
+                // Interrupt handler only wakes up a single future, but many futures depend on it. These
+                // dependent futures will register with the waker list. Unconditionally wake them
+                // all up on every poll of our service
+
+                for (_, waker) in &*self.waker_list.lock() {
+                    waker.wake_by_ref();
+                }
+
+                Poll::Pending
+            }
+        }
+
+        Service {
+            service_waker: &self.service_waker,
+            waker_list: &self.waker_list,
+        }
+        .await;
     }
 
     pub async fn log_mac(&self) {
