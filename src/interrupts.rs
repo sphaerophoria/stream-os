@@ -3,14 +3,10 @@ use crate::{
     util::bit_manipulation::SetBits,
     util::interrupt_guard::InterruptGuarded,
 };
-use alloc::boxed::Box;
-use core::{
-    arch::asm,
-    cell::{RefCell, UnsafeCell},
-};
+use alloc::{boxed::Box, vec::Vec};
+use core::{arch::asm, cell::UnsafeCell};
 use hashbrown::HashMap;
 
-static INTERRUPT_TABLE: InterruptTable = InterruptTable::new();
 static INTERRUPT_HANDLER_DATA: InterruptHandlerData = InterruptHandlerData::new();
 static ISRS: Isrs = Isrs(UnsafeCell::new([[0; 21]; 255]));
 
@@ -53,20 +49,6 @@ struct Idt {
     size: u16,
     offset: u32,
 }
-
-struct InterruptTable {
-    inner: RefCell<[GateDescriptor; 256]>,
-}
-
-impl InterruptTable {
-    const fn new() -> Self {
-        Self {
-            inner: RefCell::new([GateDescriptor(0); 256]),
-        }
-    }
-}
-
-unsafe impl Sync for InterruptTable {}
 
 #[repr(C)]
 #[derive(Debug)]
@@ -360,6 +342,7 @@ pub fn init(
 
     pic_disable_interrupts(&mut pic_io).map_err(InitInterruptError::DisableInterrupts)?;
 
+    let mut table = Vec::with_capacity(255);
     for i in 0..255 {
         unsafe {
             (*ISRS.0.get())[i] = generate_interrupt_stub(i as u8);
@@ -373,12 +356,11 @@ pub fn init(
                 p: true,
             });
 
-            let mut table = INTERRUPT_TABLE.inner.borrow_mut();
-            table[i] = descriptor;
+            table.push(descriptor);
         }
     }
 
-    let table = INTERRUPT_TABLE.inner.borrow_mut();
+    let table = table.leak();
     let table_ptr: *const GateDescriptor = table.as_ptr();
 
     let idt = Idt {
