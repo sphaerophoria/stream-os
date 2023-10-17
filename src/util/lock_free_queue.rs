@@ -17,6 +17,7 @@ struct Storage<T> {
     reserved: AtomicUsize,
 }
 
+#[derive(Clone)]
 pub struct Sender<T> {
     storage: Arc<Storage<T>>,
 }
@@ -87,6 +88,22 @@ pub struct Receiver<T> {
 }
 
 impl<T> Receiver<T> {
+    #[allow(unused)]
+    pub fn size(&self) -> usize {
+        unsafe {
+            let len = (*self.storage.elements.get()).len();
+            let head = self.storage.head.load(Ordering::Acquire);
+            let tail = self.storage.tail.load(Ordering::Acquire);
+            if self.storage.tail.load(Ordering::Acquire) == len {
+                len
+            } else if tail >= head {
+                tail - head
+            } else {
+                len - (head - tail)
+            }
+        }
+    }
+
     pub fn pop(&mut self) -> Option<T> {
         let num_elems = self.storage.valid.len();
         let head = self.storage.head.load(Ordering::Acquire);
@@ -158,6 +175,7 @@ pub fn channel<T>(num_elems: usize) -> (Sender<T>, Receiver<T>) {
 
 unsafe impl<T> Sync for Receiver<T> {}
 unsafe impl<T> Sync for Sender<T> {}
+unsafe impl<T> Send for Sender<T> {}
 
 fn wrapping_increment(i: usize, size: usize) -> usize {
     (i + 1) % size

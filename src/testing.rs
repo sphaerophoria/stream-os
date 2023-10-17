@@ -1,4 +1,4 @@
-use crate::future;
+use crate::future::Executor;
 
 use core::{future::Future, pin::Pin};
 
@@ -12,7 +12,8 @@ pub struct TestCase {
 
 pub fn test_runner(test_fns: &[&TestCase]) {
     let mut any_failed = false;
-    future::execute_fut(async {
+    let mut executor = Executor::new();
+    executor.spawn(async {
         for test_case in test_fns {
             print!("{}... ", test_case.name);
             if let Err(e) = (test_case.test)().await {
@@ -23,6 +24,7 @@ pub fn test_runner(test_fns: &[&TestCase]) {
             }
         }
     });
+    executor.run();
 
     if any_failed {
         unsafe {

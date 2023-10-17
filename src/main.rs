@@ -51,7 +51,7 @@ use hashbrown::HashMap;
 
 use crate::{
     framebuffer::FrameBuffer,
-    future::execute_fut,
+    future::Executor,
     interrupts::{InitInterruptError, InterruptHandlerData},
     io::{
         io_allocator::IoAllocator, pci::Pci, ps2::Ps2Keyboard, rtc::Rtc, serial::Serial,
@@ -264,21 +264,23 @@ impl Kernel {
         })
     }
 
-    async unsafe fn demo(&mut self) {
-        info!("A vector: {:?}", vec![1, 2, 3, 4, 5]);
-        let a_map: hashbrown::HashMap<&'static str, i32> =
-            [("test", 1), ("test2", 2)].into_iter().collect();
-        info!("A map: {:?}", a_map);
+    unsafe fn demo(&mut self) {
+        let init_demo = async {
+            info!("A vector: {:?}", vec![1, 2, 3, 4, 5]);
+            let a_map: hashbrown::HashMap<&'static str, i32> =
+                [("test", 1), ("test2", 2)].into_iter().collect();
+            info!("A map: {:?}", a_map);
 
-        let mut date = self.rtc.read().expect("failed to read date");
-        info!("Current date: {:?}", date);
-        date.hours = (date.hours + 1) % 24;
-        self.rtc.write(&date).expect("failed to write rtc date");
+            let mut date = self.rtc.read().expect("failed to read date");
+            info!("Current date: {:?}", date);
+            date.hours = (date.hours + 1) % 24;
+            self.rtc.write(&date).expect("failed to write rtc date");
 
-        let date = self.rtc.read().expect("failed to read date");
-        info!("Current date modified in cmos: {:?}", date);
+            let date = self.rtc.read().expect("failed to read date");
+            info!("Current date modified in cmos: {:?}", date);
 
-        self.rtl8139.log_mac().await;
+            self.rtl8139.log_mac().await;
+        };
 
         let send_udp = async {
             let mac = self.rtl8139.get_mac();
@@ -364,10 +366,6 @@ impl Kernel {
         let recv = async {
             recv_loop(&self.rtl8139, &self.arp_table, &self.tcp, &self.rng).await;
         };
-        let recv: Pin<&mut dyn core::future::Future<Output = ()>> = core::pin::pin!(recv);
-
-        let outgoing = core::pin::pin!(send_udp);
-        let handle_tcp_connection = core::pin::pin!(echo_tcp);
 
         let mut game = game::Game::new(
             &mut self.framebuffer,
@@ -376,16 +374,18 @@ impl Kernel {
             &self.wakeup_requester,
         );
 
-        futures::future::join_all([
-            recv,
-            handle_tcp_connection,
-            core::pin::pin!(tcp_service),
-            outgoing,
-            core::pin::pin!(game.run()),
-            core::pin::pin!(self.wakeup_service.service()),
-            core::pin::pin!(self.rtl8139.service()),
-        ])
-        .await;
+        let mut executor = Executor::new();
+        executor.spawn(logger::service());
+        executor.spawn(init_demo);
+        executor.spawn(recv);
+        executor.spawn(echo_tcp);
+        executor.spawn(tcp_service);
+        executor.spawn(send_udp);
+        executor.spawn(game.run());
+        executor.spawn(self.wakeup_service.service());
+        executor.spawn(self.rtl8139.service());
+        executor.run();
+
         info!("And now we exit/halt");
     }
 }
@@ -556,66 +556,54 @@ async fn recv_loop(rtl8139: &Rtl8139, arp_table: &ArpTable, tcp: &Tcp, rng: &Mut
     }
 }
 
-async unsafe fn async_main(mut kernel: Kernel) {
-    let sleep = {
-        let monotonic_time = Rc::clone(&kernel.monotonic_time);
-        let wakeup_requester = kernel.wakeup_requester.clone();
-        move |t| {
-            let monotonic_time = Rc::clone(&monotonic_time);
-            let wakeup_requester = wakeup_requester.clone();
-            Box::pin(async move { sleep::sleep(t, &monotonic_time, &wakeup_requester).await })
+#[cfg(test)]
+async unsafe fn test_and_wait(kernel: &Kernel) {
+    test_main();
+
+    let start = kernel.monotonic_time.get();
+    // t * t/s
+    let end = (start as f32 + 0.1 / kernel.monotonic_time.tick_freq()) as usize;
+
+    struct BusyWait {
+        monotonic_time: Rc<MonotonicTime>,
+        end: usize,
+    }
+
+    impl core::future::Future for BusyWait {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.monotonic_time.get() < self.end {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
         }
-    };
+    }
 
-    let demo_fut = async {
-        #[cfg(test)]
-        {
-            test_main();
+    BusyWait {
+        monotonic_time: Rc::clone(&kernel.monotonic_time),
+        end,
+    }
+    .await;
 
-            let start = kernel.monotonic_time.get();
-            // t * t/s
-            let end = (start as f32 + 0.1 / kernel.monotonic_time.tick_freq()) as usize;
-
-            struct BusyWait {
-                monotonic_time: Rc<MonotonicTime>,
-                end: usize,
-            }
-
-            impl core::future::Future for BusyWait {
-                type Output = ();
-
-                fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                    if self.monotonic_time.get() < self.end {
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    } else {
-                        Poll::Ready(())
-                    }
-                }
-            }
-
-            BusyWait {
-                monotonic_time: Rc::clone(&kernel.monotonic_time),
-                end,
-            }
-            .await;
-
-            io::exit(0);
-        }
-
-        kernel.demo().await;
-        // FIXME: Sleep for a little longer to give the logger time to print the last message
-        sleep(0.1).await;
-    };
-
-    futures::future::join(Box::pin(logger::service()), Box::pin(demo_fut)).await;
+    io::exit(0);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const MultibootInfo) -> i32 {
-    let kernel = Kernel::init(info).expect("Failed to initialize kernel");
+    let mut kernel = Kernel::init(info).expect("Failed to initialize kernel");
 
-    execute_fut(async_main(kernel));
+    #[cfg(test)]
+    {
+        let mut executor = Executor::new();
+        executor.spawn(logger::service());
+        executor.spawn(test_and_wait(&kernel));
+        executor.run();
+    }
+
+    kernel.demo();
 
     io::exit(0);
     0
