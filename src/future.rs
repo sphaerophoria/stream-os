@@ -1,49 +1,42 @@
 use core::{
     future::Future,
     sync::atomic::{AtomicBool, Ordering},
-    task::{RawWaker, RawWakerVTable},
 };
 
-static SHOULD_POLL: AtomicBool = AtomicBool::new(false);
+use alloc::{sync::Arc, task::Wake};
 
-const WAKER_VTABLE: RawWakerVTable = create_raw_waker_vtable();
-
-const fn create_raw_waker_vtable() -> RawWakerVTable {
-    RawWakerVTable::new(waker_clone, waker_wake, waker_wake, waker_drop)
+struct KernelWaker {
+    should_poll: AtomicBool,
 }
 
-unsafe fn waker_clone(_: *const ()) -> RawWaker {
-    RawWaker::new(core::ptr::null(), &WAKER_VTABLE)
+impl Wake for KernelWaker {
+    fn wake(self: Arc<Self>) {
+        self.should_poll.store(true, Ordering::Release);
+    }
 }
-
-unsafe fn waker_wake(_: *const ()) {
-    SHOULD_POLL.store(true, Ordering::Release);
-}
-
-unsafe fn waker_drop(_: *const ()) {}
 
 pub fn execute_fut<F: Future>(mut fut: F) {
     let mut fut = unsafe { core::pin::Pin::new_unchecked(&mut fut) };
 
-    let waker = unsafe {
-        let waker = waker_clone(core::ptr::null());
-        core::task::Waker::from_raw(waker)
-    };
+    let waker = Arc::new(KernelWaker {
+        should_poll: AtomicBool::new(true),
+    });
 
-    let mut context = core::task::Context::from_waker(&waker);
+    let context_waker = Arc::clone(&waker).into();
+    let mut context = core::task::Context::from_waker(&context_waker);
 
     loop {
-        SHOULD_POLL.store(false, Ordering::Release);
+        waker.should_poll.store(false, Ordering::Release);
 
         if fut.as_mut().poll(&mut context).is_ready() {
             break;
         }
 
-        if SHOULD_POLL.load(Ordering::Acquire) {
+        if waker.should_poll.load(Ordering::Acquire) {
             continue;
         }
 
-        while !SHOULD_POLL.load(Ordering::Acquire) {
+        while !waker.should_poll.load(Ordering::Acquire) {
             unsafe {
                 core::arch::asm!("hlt");
             }
