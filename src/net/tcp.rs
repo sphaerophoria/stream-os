@@ -6,6 +6,7 @@ use crate::{
     util::{
         async_channel::{self, Receiver, Sender},
         async_mutex::Mutex,
+        atomic_cell::AtomicCell,
         bit_manipulation::{GetBits, SetBits},
     },
     IpAddr,
@@ -16,7 +17,7 @@ use alloc::{boxed::Box, collections::VecDeque, rc::Rc, vec::Vec};
 use core::{
     future::Future,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 use hashbrown::HashMap;
 
@@ -350,6 +351,7 @@ pub struct Tcp {
     listeners: Mutex<HashMap<TcpListenerKey, Sender<TcpConnection>>>,
     tcp_states: Mutex<HashMap<TcpKey, TcpState>>,
     time: Rc<MonotonicTime>,
+    service_waker: AtomicCell<Waker>,
     wakeup_list: WakeupRequester,
 }
 
@@ -358,6 +360,7 @@ impl Tcp {
         Tcp {
             listeners: Mutex::new(Default::default()),
             tcp_states: Mutex::new(Default::default()),
+            service_waker: AtomicCell::new(),
             time,
             wakeup_list,
         }
@@ -393,7 +396,7 @@ impl Tcp {
             let state = tcp_states.entry(tcp_key).or_insert(TcpState::Uninit);
             let flags = frame.flags();
 
-            match state {
+            let ret = match state {
                 TcpState::Uninit => {
                     if !flags.syn() {
                         return None;
@@ -564,7 +567,13 @@ impl Tcp {
 
                     None
                 }
+            };
+
+            if let Some(service_waker) = self.service_waker.get() {
+                service_waker.wake_by_ref();
             }
+
+            ret
         })
     }
 
@@ -572,6 +581,7 @@ impl Tcp {
         OutgoingPoller {
             tcp_states: &self.tcp_states,
             time: &self.time,
+            waker: &self.service_waker,
         }
         .await
     }
@@ -580,12 +590,15 @@ impl Tcp {
 struct OutgoingPoller<'a> {
     tcp_states: &'a Mutex<HashMap<TcpKey, TcpState>>,
     time: &'a MonotonicTime,
+    waker: &'a AtomicCell<Waker>,
 }
 
 impl Future for OutgoingPoller<'_> {
     type Output = OutgoingTcpPacket;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.waker.store(cx.waker().clone());
+
         let guard = core::pin::pin!(self.tcp_states.lock()).poll(cx);
 
         let mut guard = match guard {
