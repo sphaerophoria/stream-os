@@ -1,20 +1,29 @@
 use crate::util::async_mutex::Mutex;
 
 use alloc::{collections::VecDeque, rc::Rc};
-use core::task::Poll;
+use core::task::{Poll, Waker};
+
+struct Inner<T> {
+    queue: VecDeque<T>,
+    waker: Option<Waker>,
+}
 
 pub struct Sender<T> {
-    inner: Rc<Mutex<VecDeque<T>>>,
+    inner: Rc<Mutex<Inner<T>>>,
 }
 
 impl<T> Sender<T> {
     pub async fn send(&self, val: T) {
-        self.inner.lock().await.push_back(val);
+        let mut inner = self.inner.lock().await;
+        inner.queue.push_back(val);
+        if let Some(waker) = &inner.waker {
+            waker.wake_by_ref();
+        }
     }
 }
 
 struct ReceiverWaiter<'a, T> {
-    inner: &'a Mutex<VecDeque<T>>,
+    inner: &'a Mutex<Inner<T>>,
 }
 
 impl<T> core::future::Future for ReceiverWaiter<'_, T> {
@@ -30,7 +39,9 @@ impl<T> core::future::Future for ReceiverWaiter<'_, T> {
             Poll::Pending => return Poll::Pending,
         };
 
-        match guard.pop_front() {
+        guard.waker = Some(cx.waker().clone());
+
+        match guard.queue.pop_front() {
             Some(v) => Poll::Ready(v),
             None => Poll::Pending,
         }
@@ -38,7 +49,7 @@ impl<T> core::future::Future for ReceiverWaiter<'_, T> {
 }
 
 pub struct Receiver<T> {
-    inner: Rc<Mutex<VecDeque<T>>>,
+    inner: Rc<Mutex<Inner<T>>>,
 }
 
 impl<T> Receiver<T> {
@@ -48,7 +59,11 @@ impl<T> Receiver<T> {
 }
 
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-    let inner = Rc::new(Mutex::new(VecDeque::new()));
+    let inner = Inner {
+        queue: VecDeque::new(),
+        waker: None,
+    };
+    let inner = Rc::new(Mutex::new(inner));
     let sender = Sender {
         inner: Rc::clone(&inner),
     };
