@@ -6,3 +6,4 @@ pub mod histogram;
 pub mod interrupt_guard;
 pub mod lock_free_queue;
 pub mod spinlock;
+pub mod waker_list;
