@@ -36,6 +36,8 @@ impl<T> Drop for MutexGuard<'_, T> {
     }
 }
 
+unsafe impl<T: Send> Send for MutexGuard<'_, T> {}
+
 pub struct Mutex<T> {
     inner: UnsafeCell<T>,
     count: AtomicUsize,
@@ -125,8 +127,8 @@ impl core::future::Future for MutexLocker<'_> {
     }
 }
 
-unsafe impl<T> Sync for Mutex<T> {}
-unsafe impl<T> Send for Mutex<T> {}
+unsafe impl<T: Send> Sync for Mutex<T> {}
+unsafe impl<T: Send> Send for Mutex<T> {}
 
 #[cfg(test)]
 mod test {

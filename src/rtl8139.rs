@@ -14,6 +14,7 @@ use hashbrown::HashMap;
 use alloc::{boxed::Box, sync::Arc, vec};
 use core::{
     future::Future,
+    ops::Deref,
     pin::Pin,
     task::{Context, Poll, Waker},
 };
@@ -294,7 +295,7 @@ unsafe fn init_capr(base: *mut u8) -> Result<(), ValueNotSet<u16>> {
 }
 
 struct TransmissionWaiter {
-    transmit_status_reg: *mut u32,
+    transmit_status_reg: HardwarePtr<u32>,
     id: usize,
     waker_list: Arc<SpinLock<HashMap<usize, Waker>>>,
 }
@@ -328,9 +329,23 @@ impl Drop for TransmissionWaiter {
     }
 }
 
+unsafe impl Send for TransmissionWaiter {}
+
+#[derive(Clone, Copy)]
+struct HardwarePtr<T>(*mut T);
+unsafe impl<T> Send for HardwarePtr<T> {}
+
+impl<T> Deref for HardwarePtr<T> {
+    type Target = *mut T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 async unsafe fn transmit_data_and_wait(
-    transmit_data_ptr: *mut u32,
-    transmit_status_reg: *mut u32,
+    transmit_data_ptr: HardwarePtr<u32>,
+    transmit_status_reg: HardwarePtr<u32>,
     data: &[u8],
     future_id: usize,
     waker_list: Arc<SpinLock<HashMap<usize, Waker>>>,
@@ -353,8 +368,8 @@ async unsafe fn transmit_data_and_wait(
 }
 
 struct ReceiverWaiter {
-    capr_reg: *mut u16,
-    cbr_reg: *mut u16,
+    capr_reg: HardwarePtr<u16>,
+    cbr_reg: HardwarePtr<u16>,
     id: usize,
     waker_list: Arc<SpinLock<HashMap<usize, Waker>>>,
 }
@@ -527,8 +542,8 @@ impl Inner {
             let extra_offset = self.transmit_idx as usize * core::mem::size_of::<u32>();
             let data_offset = TRANSMIT_DATA_OFFSET + extra_offset;
             let status_offset = TRANSMIT_STATUS_OFFSET + extra_offset;
-            let data_ptr = self.base.add(data_offset) as *mut u32;
-            let status_ptr = self.base.add(status_offset) as *mut u32;
+            let data_ptr = HardwarePtr(self.base.add(data_offset) as *mut u32);
+            let status_ptr = HardwarePtr(self.base.add(status_offset) as *mut u32);
             let future_id = self.future_id;
             self.future_id += 1;
             transmit_data_and_wait(
@@ -577,6 +592,8 @@ impl Inner {
     }
 }
 
+unsafe impl Send for Inner {}
+
 pub struct Rtl8139 {
     inner: Mutex<Inner>,
     waker_list: Arc<SpinLock<HashMap<usize, Waker>>>,
@@ -617,9 +634,9 @@ impl Rtl8139 {
         Fut: core::future::Future<Output = ()>,
     {
         unsafe {
-            let base = self.inner.lock().await.base;
-            let capr_reg = base.add(CAPR_OFFSET) as *mut u16;
-            let cbr_reg = base.add(CBR_OFFSET) as *mut u16;
+            let base = HardwarePtr(self.inner.lock().await.base);
+            let capr_reg = HardwarePtr(base.add(CAPR_OFFSET) as *mut u16);
+            let cbr_reg = HardwarePtr(base.add(CBR_OFFSET) as *mut u16);
 
             let fut = loop {
                 let (id, waker_list) = {

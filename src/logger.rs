@@ -6,6 +6,7 @@ use crate::util::{
 use alloc::string::String;
 use core::{
     cell::UnsafeCell,
+    ops::Deref,
     task::{Poll, Waker},
 };
 use hashbrown::HashMap;
@@ -78,6 +79,14 @@ macro_rules! error {
 
 pub static LOGGER: LoggerHolder = LoggerHolder(UnsafeCell::new(None));
 pub struct LoggerHolder(pub UnsafeCell<Option<Logger>>);
+
+impl Deref for LoggerHolder {
+    type Target = Logger;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { (*self.0.get()).as_mut().expect("Logger not initialized") }
+    }
+}
 unsafe impl Sync for LoggerHolder {}
 
 pub struct Log {
@@ -200,11 +209,5 @@ pub fn init(log_levels: HashMap<String, LogLevel>) {
 }
 
 pub async fn service() {
-    unsafe {
-        (*LOGGER.0.get())
-            .as_mut()
-            .expect("Logger not initialized")
-            .service()
-            .await;
-    }
+    LOGGER.service().await;
 }

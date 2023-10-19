@@ -173,9 +173,9 @@ pub fn channel<T>(num_elems: usize) -> (Sender<T>, Receiver<T>) {
     (tx, rx)
 }
 
-unsafe impl<T> Sync for Receiver<T> {}
-unsafe impl<T> Sync for Sender<T> {}
-unsafe impl<T> Send for Sender<T> {}
+unsafe impl<T: Send> Send for Receiver<T> {}
+unsafe impl<T: Send> Sync for Sender<T> {}
+unsafe impl<T: Send> Send for Sender<T> {}
 
 fn wrapping_increment(i: usize, size: usize) -> usize {
     (i + 1) % size

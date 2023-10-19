@@ -12,7 +12,7 @@ use crate::{
     IpAddr,
 };
 
-use alloc::{boxed::Box, collections::VecDeque, rc::Rc, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
 
 use core::{
     future::Future,
@@ -203,7 +203,7 @@ pub struct TcpFrameParams {
     pub flags: TcpFlags,
     pub window_size: u16,
     pub urgent_ptr: u16,
-    pub payload: Rc<[u8]>,
+    pub payload: Arc<[u8]>,
 }
 
 pub fn generate_tcp_frame(params: &TcpFrameParams) -> Vec<u8> {
@@ -245,7 +245,7 @@ pub fn generate_tcp_frame(params: &TcpFrameParams) -> Vec<u8> {
 fn generate_tcp_push(
     tcp_key: &TcpKey,
     state: &mut ConnectedState,
-    data: Rc<[u8]>,
+    data: Arc<[u8]>,
 ) -> TcpFrameParams {
     let payload_length = data.len();
     let ret = TcpFrameParams {
@@ -303,9 +303,9 @@ struct ConnectedState {
     window_size: u16,
     dup_ack_counter: u8,
     unacknowledged: VecDeque<UnackedPacket>,
-    to_send: VecDeque<Rc<[u8]>>,
+    to_send: VecDeque<Arc<[u8]>>,
     tx: Sender<Vec<u8>>,
-    rx: Receiver<Rc<[u8]>>,
+    rx: Receiver<Arc<[u8]>>,
 }
 
 enum TcpState {
@@ -321,7 +321,7 @@ enum TcpState {
 
 pub struct TcpConnection {
     rx: Receiver<Vec<u8>>,
-    tx: Sender<Rc<[u8]>>,
+    tx: Sender<Arc<[u8]>>,
 }
 
 impl TcpConnection {
@@ -331,7 +331,7 @@ impl TcpConnection {
 
     pub async fn write<T>(&self, data: T)
     where
-        T: Into<Rc<[u8]>>,
+        T: Into<Arc<[u8]>>,
     {
         self.tx.send(data.into()).await;
     }
@@ -350,13 +350,13 @@ impl TcpListener {
 pub struct Tcp {
     listeners: Mutex<HashMap<TcpListenerKey, Sender<TcpConnection>>>,
     tcp_states: Mutex<HashMap<TcpKey, TcpState>>,
-    time: Rc<MonotonicTime>,
+    time: Arc<MonotonicTime>,
     service_waker: AtomicCell<Waker>,
     wakeup_list: WakeupRequester,
 }
 
 impl Tcp {
-    pub fn new(time: Rc<MonotonicTime>, wakeup_list: WakeupRequester) -> Tcp {
+    pub fn new(time: Arc<MonotonicTime>, wakeup_list: WakeupRequester) -> Tcp {
         Tcp {
             listeners: Mutex::new(Default::default()),
             tcp_states: Mutex::new(Default::default()),
@@ -383,7 +383,7 @@ impl Tcp {
         source_ip: &'a IpAddr,
         dest_ip: &'a IpAddr,
         rng: &'a Mutex<Rng>,
-    ) -> Pin<Box<dyn Future<Output = Option<Rc<[u8]>>> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Option<Arc<[u8]>>> + 'a + Send>> {
         Box::pin(async move {
             let tcp_key = TcpKey {
                 remote_ip: *source_ip,
@@ -423,14 +423,14 @@ impl Tcp {
                             fin: false,
                         }),
                         urgent_ptr: 0,
-                        payload: Rc::new([]),
+                        payload: Arc::new([]),
                     })
                     .into();
 
                     let sent_frame = OutgoingTcpPacket {
                         local_ip: *dest_ip,
                         remote_ip: *source_ip,
-                        payload: Rc::clone(&response_frame),
+                        payload: Arc::clone(&response_frame),
                     };
 
                     let timeout = (self.time.get() as f32 + 1.0 * self.time.tick_freq()) as usize;
@@ -556,7 +556,7 @@ impl Tcp {
                             fin: false,
                         }),
                         urgent_ptr: 0,
-                        payload: Rc::new([]),
+                        payload: Arc::new([]),
                     })
                     .into();
 
@@ -666,7 +666,7 @@ fn write_request_to_outgoing_packet(
     tcp_key: &TcpKey,
     connected_state: &mut ConnectedState,
     time: &MonotonicTime,
-    data: Rc<[u8]>,
+    data: Arc<[u8]>,
 ) -> OutgoingTcpPacket {
     // FIXME: Hidden mutation of connected state
     let params = generate_tcp_push(tcp_key, connected_state, data);
@@ -687,7 +687,7 @@ fn write_request_to_outgoing_packet(
 pub struct OutgoingTcpPacket {
     pub local_ip: IpAddr,
     pub remote_ip: IpAddr,
-    pub payload: Rc<[u8]>,
+    pub payload: Arc<[u8]>,
 }
 
 #[cfg(test)]
@@ -698,17 +698,17 @@ mod test {
     use alloc::string::{String, ToString};
 
     struct TcpFixture {
-        time: Rc<MonotonicTime>,
+        time: Arc<MonotonicTime>,
         tcp: Tcp,
         rng: Mutex<Rng>,
     }
 
     fn gen_fixture() -> TcpFixture {
-        let time = Rc::new(MonotonicTime::new(10.0));
+        let time = Arc::new(MonotonicTime::new(10.0));
         let (wakeup_list, _, _) = crate::sleep::construct_wakeup_handlers();
         let rng = Mutex::new(Rng::new(0));
 
-        let tcp = Tcp::new(Rc::clone(&time), wakeup_list);
+        let tcp = Tcp::new(Arc::clone(&time), wakeup_list);
 
         TcpFixture { time, tcp, rng }
     }
@@ -724,7 +724,7 @@ mod test {
     }
 
     impl MockClient {
-        fn syn(&mut self) -> Rc<[u8]> {
+        fn syn(&mut self) -> Arc<[u8]> {
             let ret = generate_tcp_frame(&TcpFrameParams {
                 source_address: self.client_ip,
                 dest_address: self.server_ip,
@@ -745,14 +745,14 @@ mod test {
                 }),
                 window_size: self.window_size,
                 urgent_ptr: 0,
-                payload: Rc::new([]),
+                payload: Arc::new([]),
             })
             .into();
             self.seq += 1;
             ret
         }
 
-        fn ack(&self) -> Rc<[u8]> {
+        fn ack(&self) -> Arc<[u8]> {
             generate_tcp_frame(&TcpFrameParams {
                 source_address: self.client_ip,
                 dest_address: self.server_ip,
@@ -772,7 +772,7 @@ mod test {
                 }),
                 window_size: self.window_size,
                 urgent_ptr: 0,
-                payload: Rc::new([]),
+                payload: Arc::new([]),
             })
             .into()
         }
@@ -953,8 +953,8 @@ mod test {
             .await
             .ok_or("Connection not ready".to_string())?;
 
-        connection.write(Rc::<str>::from("hello world")).await;
-        connection.write(Rc::<str>::from("hello world 2")).await;
+        connection.write(Arc::<str>::from("hello world")).await;
+        connection.write(Arc::<str>::from("hello world 2")).await;
 
         let frame = futures::future::poll_immediate(fixture.tcp.service())
             .await

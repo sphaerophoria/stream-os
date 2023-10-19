@@ -6,8 +6,9 @@ use alloc::{boxed::Box, string::String};
 
 pub struct TestCase {
     pub name: &'static str,
-    pub test:
-        &'static (dyn Send + Sync + Fn() -> Pin<Box<dyn Future<Output = Result<(), String>>>>),
+    pub test: &'static (dyn Send
+                  + Sync
+                  + Fn() -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>),
 }
 
 pub fn test_runner(test_fns: &[&TestCase]) {
@@ -42,7 +43,7 @@ macro_rules! create_test {
                 name: concat!(file!(), " ", stringify!($name)),
                 test: &[<$name _test>],
             };
-            fn [<$name _test>]() -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output=Result<(), alloc::string::String>>>> {
+            fn [<$name _test>]() -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output=Result<(), alloc::string::String>> + Send>> {
                 alloc::boxed::Box::pin(async {
                     $content
                 })

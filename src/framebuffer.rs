@@ -45,3 +45,5 @@ impl FrameBuffer {
         }
     }
 }
+
+unsafe impl Send for FrameBuffer {}

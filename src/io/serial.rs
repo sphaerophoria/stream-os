@@ -82,6 +82,8 @@ impl Serial {
     }
 }
 
+unsafe impl Sync for Serial {}
+
 fn is_transmit_ready(serial_io: &mut IoRange) -> bool {
     (serial_io
         .read_u8(LINE_STATUS_OFFSET)

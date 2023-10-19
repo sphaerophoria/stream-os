@@ -37,12 +37,11 @@ mod sleep;
 mod time;
 mod util;
 
-use alloc::{boxed::Box, rc::Rc, vec, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use futures::future::Either;
 
 use core::{
     arch::global_asm,
-    cell::RefCell,
     panic::PanicInfo,
     pin::Pin,
     task::{Context, Poll},
@@ -53,10 +52,7 @@ use crate::{
     framebuffer::FrameBuffer,
     future::Executor,
     interrupts::{InitInterruptError, InterruptHandlerData},
-    io::{
-        io_allocator::IoAllocator, pci::Pci, ps2::Ps2Keyboard, rtc::Rtc, serial::Serial,
-        vga::TerminalWriter,
-    },
+    io::{io_allocator::IoAllocator, pci::Pci, ps2::Ps2Keyboard, rtc::Rtc, serial::Serial},
     multiboot::MultibootInfo,
     net::{
         tcp::Tcp, ArpFrame, ArpFrameParams, ArpOperation, EtherType, EthernetFrameParams,
@@ -84,8 +80,7 @@ extern "C" {
 
 struct EarlyInitHandles {
     io_allocator: IoAllocator,
-    terminal_writer: Rc<RefCell<TerminalWriter>>,
-    serial: Rc<Serial>,
+    serial: Arc<Serial>,
     interrupt_handlers: &'static InterruptHandlerData,
 }
 
@@ -98,25 +93,21 @@ unsafe fn interrupt_guarded_init(
     allocator::init(&*info);
     logger::init(Default::default());
     let mut io_allocator = io::io_allocator::IoAllocator::new();
-    let terminal_writer = Rc::new(RefCell::new(TerminalWriter::new()));
-    let serial = Rc::new(Serial::new(&mut io_allocator).expect("Failed to initialize serial"));
+    let serial = Arc::new(Serial::new(&mut io_allocator).expect("Failed to initialize serial"));
 
     struct SerialWriter {
-        serial: Rc<Serial>,
-        terminal_writer: Rc<RefCell<TerminalWriter>>,
+        serial: Arc<Serial>,
     }
 
     impl core::fmt::Write for SerialWriter {
         fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let _ = self.terminal_writer.borrow_mut().write_str(s);
             self.serial.write_str(s);
             Ok(())
         }
     }
 
     io::init_stdio(Box::new(SerialWriter {
-        serial: Rc::clone(&serial),
-        terminal_writer: Rc::clone(&terminal_writer),
+        serial: Arc::clone(&serial),
     }));
 
     gdt::init();
@@ -125,7 +116,6 @@ unsafe fn interrupt_guarded_init(
 
     Ok(EarlyInitHandles {
         io_allocator,
-        terminal_writer,
         serial,
         interrupt_handlers,
     })
@@ -193,11 +183,10 @@ struct Kernel {
     ps2: Ps2Keyboard,
     rtl8139: Rtl8139,
     arp_table: ArpTable,
-    serial: Rc<Serial>,
+    serial: Arc<Serial>,
     framebuffer: FrameBuffer,
     tcp: Tcp,
-    terminal_writer: Rc<RefCell<TerminalWriter>>,
-    monotonic_time: Rc<MonotonicTime>,
+    monotonic_time: Arc<MonotonicTime>,
     wakeup_requester: WakeupRequester,
     wakeup_service: WakeupService,
 }
@@ -206,18 +195,17 @@ impl Kernel {
     unsafe fn init(info: *const MultibootInfo) -> Result<Kernel, InitInterruptError> {
         let EarlyInitHandles {
             mut io_allocator,
-            terminal_writer,
             serial,
             interrupt_handlers,
         } = interrupt_guarded_init(info)?;
 
-        let monotonic_time = Rc::new(MonotonicTime::new(Rtc::tick_freq()));
+        let monotonic_time = Arc::new(MonotonicTime::new(Rtc::tick_freq()));
         let (wakeup_requester, wakeup_service, mut interrupt_wakeups) =
             sleep::construct_wakeup_handlers();
         io::init_late(&mut io_allocator);
 
         let on_tick = {
-            let monotonic_time = Rc::clone(&monotonic_time);
+            let monotonic_time = Arc::clone(&monotonic_time);
 
             move || {
                 let tick = monotonic_time.increment();
@@ -235,7 +223,7 @@ impl Kernel {
 
         let arp_table = ArpTable::new();
         let rng = Mutex::new(Rng::new(rtc.read().unwrap().seconds as u64));
-        let tcp = Tcp::new(Rc::clone(&monotonic_time), wakeup_requester.clone());
+        let tcp = Tcp::new(Arc::clone(&monotonic_time), wakeup_requester.clone());
 
         let framebuffer = FrameBuffer::new(
             (*info)
@@ -257,7 +245,6 @@ impl Kernel {
             serial,
             tcp,
             framebuffer,
-            terminal_writer,
             monotonic_time,
             wakeup_service,
             wakeup_requester,
@@ -557,15 +544,15 @@ async fn recv_loop(rtl8139: &Rtl8139, arp_table: &ArpTable, tcp: &Tcp, rng: &Mut
 }
 
 #[cfg(test)]
-async unsafe fn test_and_wait(kernel: &Kernel) {
+async unsafe fn test_and_wait(monotonic_time: Arc<MonotonicTime>) {
     test_main();
 
-    let start = kernel.monotonic_time.get();
+    let start = monotonic_time.get();
     // t * t/s
-    let end = (start as f32 + 0.1 / kernel.monotonic_time.tick_freq()) as usize;
+    let end = (start as f32 + 0.1 / monotonic_time.tick_freq()) as usize;
 
     struct BusyWait {
-        monotonic_time: Rc<MonotonicTime>,
+        monotonic_time: Arc<MonotonicTime>,
         end: usize,
     }
 
@@ -583,7 +570,7 @@ async unsafe fn test_and_wait(kernel: &Kernel) {
     }
 
     BusyWait {
-        monotonic_time: Rc::clone(&kernel.monotonic_time),
+        monotonic_time: Arc::clone(&monotonic_time),
         end,
     }
     .await;
@@ -599,7 +586,7 @@ pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const Multibo
     {
         let mut executor = Executor::new();
         executor.spawn(logger::service());
-        executor.spawn(test_and_wait(&kernel));
+        executor.spawn(test_and_wait(Arc::clone(&kernel.monotonic_time)));
         executor.run();
     }
 

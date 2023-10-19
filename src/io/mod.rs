@@ -6,8 +6,6 @@ use core::{
 };
 use io_allocator::{IoAllocator, IoOffset, IoRange};
 
-#[macro_use]
-pub mod vga;
 pub mod io_allocator;
 pub mod pci;
 pub mod ps2;

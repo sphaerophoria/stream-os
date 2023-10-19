@@ -40,7 +40,7 @@ impl<'a> Executor<'a> {
         }
     }
 
-    pub fn spawn<F: Future<Output = ()> + 'a>(&mut self, fut: F) {
+    pub fn spawn<F: Future<Output = ()> + 'a + Send>(&mut self, fut: F) {
         let id = self.id;
         self.id += 1;
 

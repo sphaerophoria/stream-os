@@ -1,6 +1,6 @@
 use crate::util::async_mutex::Mutex;
 
-use alloc::{collections::VecDeque, rc::Rc};
+use alloc::{collections::VecDeque, sync::Arc};
 use core::task::{Poll, Waker};
 
 struct Inner<T> {
@@ -9,7 +9,7 @@ struct Inner<T> {
 }
 
 pub struct Sender<T> {
-    inner: Rc<Mutex<Inner<T>>>,
+    inner: Arc<Mutex<Inner<T>>>,
 }
 
 impl<T> Sender<T> {
@@ -49,7 +49,7 @@ impl<T> core::future::Future for ReceiverWaiter<'_, T> {
 }
 
 pub struct Receiver<T> {
-    inner: Rc<Mutex<Inner<T>>>,
+    inner: Arc<Mutex<Inner<T>>>,
 }
 
 impl<T> Receiver<T> {
@@ -63,9 +63,9 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
         queue: VecDeque::new(),
         waker: None,
     };
-    let inner = Rc::new(Mutex::new(inner));
+    let inner = Arc::new(Mutex::new(inner));
     let sender = Sender {
-        inner: Rc::clone(&inner),
+        inner: Arc::clone(&inner),
     };
     let receiver = Receiver { inner };
     (sender, receiver)
