@@ -11,34 +11,38 @@ use core::{
 };
 
 use alloc::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     sync::Arc,
 };
 
 // Multi-thread way to request wakeups
 #[derive(Clone)]
 pub struct WakeupRequester {
-    posted_wakeup_times: Arc<Mutex<VecDeque<usize>>>,
+    posted_wakeup_times: Arc<Mutex<VecDeque<(usize, Waker)>>>,
+    service_waker: Arc<AtomicCell<Waker>>,
 }
 
 impl WakeupRequester {
     pub async fn register_wakeup_time(&self, tick: usize) {
+        let waker = futures::future::poll_fn(|cx| Poll::Ready(cx.waker().clone())).await;
         let mut wakeup_times = self.posted_wakeup_times.lock().await;
-        wakeup_times.push_back(tick);
+        wakeup_times.push_back((tick, waker));
+        if let Some(waker) = self.service_waker.get() {
+            waker.wake_by_ref();
+        }
     }
 }
 
 struct TimeWaiter<'a> {
-    posted_wakeup_times: &'a Arc<Mutex<VecDeque<usize>>>,
-    waker: &'a AtomicCell<Waker>,
+    posted_wakeup_times: &'a Arc<Mutex<VecDeque<(usize, Waker)>>>,
+    service_waker: &'a AtomicCell<Waker>,
 }
 
 impl core::future::Future for TimeWaiter<'_> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let waker = cx.waker();
-        self.waker.store(waker.clone());
+        self.service_waker.store(cx.waker().clone());
 
         let pinned = core::pin::pin!(self.posted_wakeup_times.lock());
         let times = match pinned.poll(cx) {
@@ -56,9 +60,9 @@ impl core::future::Future for TimeWaiter<'_> {
 
 // Registers wakeup requests with interrupt handler
 pub struct WakeupService {
-    posted_wakeup_times: Arc<Mutex<VecDeque<usize>>>,
-    interrupt_visible_wakeup_times: Arc<InterruptGuarded<BTreeSet<usize>>>,
-    waker: Arc<AtomicCell<Waker>>,
+    posted_wakeup_times: Arc<Mutex<VecDeque<(usize, Waker)>>>,
+    interrupt_visible_wakeup_times: Arc<InterruptGuarded<BTreeMap<usize, Waker>>>,
+    service_waker: Arc<AtomicCell<Waker>>,
 }
 
 impl WakeupService {
@@ -66,14 +70,14 @@ impl WakeupService {
         loop {
             TimeWaiter {
                 posted_wakeup_times: &self.posted_wakeup_times,
-                waker: &self.waker,
+                service_waker: &self.service_waker,
             }
             .await;
             let mut wakeup_times = self.posted_wakeup_times.lock().await;
             let mut interrupt_times = self.interrupt_visible_wakeup_times.lock();
             let len = wakeup_times.len();
-            for time in wakeup_times.drain(..len) {
-                interrupt_times.insert(time);
+            for (time, waker) in wakeup_times.drain(..len) {
+                interrupt_times.insert(time, waker);
             }
         }
     }
@@ -81,8 +85,7 @@ impl WakeupService {
 
 // Checks wakeups in interrupt handler
 pub struct InterruptWakeupList {
-    wakeup_times: Arc<InterruptGuarded<BTreeSet<usize>>>,
-    waker: Arc<AtomicCell<Waker>>,
+    wakeup_times: Arc<InterruptGuarded<BTreeMap<usize, Waker>>>,
 }
 
 impl InterruptWakeupList {
@@ -90,7 +93,7 @@ impl InterruptWakeupList {
         let mut wakeup_times = self.wakeup_times.lock();
 
         let mut last_idx = 0;
-        for (i, item) in wakeup_times.iter().enumerate() {
+        for (i, (item, _)) in wakeup_times.iter().enumerate() {
             if *item > time {
                 break;
             }
@@ -98,36 +101,31 @@ impl InterruptWakeupList {
         }
 
         for _ in 0..last_idx {
-            wakeup_times.pop_first();
-        }
-
-        if last_idx > 0 {
-            if let Some(waker) = self.waker.get() {
-                waker.wake_by_ref()
-            }
+            let (_, waker) = wakeup_times.pop_first().expect("Expected a time");
+            waker.wake_by_ref();
         }
     }
 }
 
 pub fn construct_wakeup_handlers() -> (WakeupRequester, WakeupService, InterruptWakeupList) {
     let posted_wakeup_times = Arc::new(Mutex::new(VecDeque::new()));
-    let interrupt_visible_wakeup_itimes = Arc::new(InterruptGuarded::new(BTreeSet::new()));
+    let interrupt_visible_wakeup_itimes = Arc::new(InterruptGuarded::new(BTreeMap::new()));
+
+    let service_waker = Arc::new(AtomicCell::new());
 
     let requester = WakeupRequester {
         posted_wakeup_times: Arc::clone(&posted_wakeup_times),
+        service_waker: Arc::clone(&service_waker),
     };
-
-    let waker = Arc::new(AtomicCell::new());
 
     let handler = WakeupService {
         posted_wakeup_times,
         interrupt_visible_wakeup_times: Arc::clone(&interrupt_visible_wakeup_itimes),
-        waker: Arc::clone(&waker),
+        service_waker,
     };
 
     let interrupt_handler = InterruptWakeupList {
         wakeup_times: interrupt_visible_wakeup_itimes,
-        waker,
     };
 
     (requester, handler, interrupt_handler)

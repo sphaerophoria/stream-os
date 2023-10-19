@@ -386,7 +386,6 @@ impl Kernel {
             core::pin::pin!(self.rtl8139.service()),
         ])
         .await;
-
         info!("And now we exit/halt");
     }
 }
