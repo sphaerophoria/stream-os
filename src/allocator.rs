@@ -1,4 +1,4 @@
-use crate::MultibootInfo;
+use crate::multiboot2::Multiboot2;
 
 use core::{
     alloc::{GlobalAlloc, Layout},
@@ -66,7 +66,7 @@ impl Allocator {
     }
 }
 
-pub unsafe fn init(info: &MultibootInfo) {
+pub unsafe fn init(info: &Multiboot2) {
     assert_eq!(
         core::mem::size_of::<UsedSegment>(),
         core::mem::size_of::<FreeSegment>()

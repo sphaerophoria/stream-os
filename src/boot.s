@@ -1,28 +1,37 @@
 /* Declare constants for the multiboot header. */
-.set ALIGN,    1<<0             /* align loaded modules on page boundaries */
-.set MEMINFO,  1<<1             /* provide memory map */
-.set VIDEO,    1<<2
-.set FLAGS,    VIDEO | ALIGN | MEMINFO  /* this is the Multiboot 'flag' field */
-.set MAGIC,    0x1BADB002       /* 'magic number' lets bootloader find the header */
-.set CHECKSUM, -(MAGIC + FLAGS) /* checksum of above, to prove we are multiboot */
+.set MULTIBOOT2_MAGIC,    0xE85250D6       /* multiboot 2 magic */
+.set MULTIBOOT2_ARCHITECTURE, 0 /*i386 */
 
 /*
-Declare a multiboot header that marks the program as a kernel. These are magic
-values that are documented in the multiboot standard. The bootloader will
+Declare a multiboot2 header that marks the program as a kernel. These are magic
+values that are documented in the multiboot2 standard. The bootloader will
 search for this signature in the first 8 KiB of the kernel file, aligned at a
 32-bit boundary. The signature is in its own section so the header can be
 forced to be within the first 8 KiB of the kernel file.
 */
 .section .multiboot
 .align 4
-.long MAGIC
-.long FLAGS
-.long CHECKSUM
-.skip 32 - 12
+.long MULTIBOOT2_MAGIC
+.long MULTIBOOT2_ARCHITECTURE
+/* Set size to 0, because alignment makes size calculation tricky, and grub
+ * doesn't seem to care that it's wrong anyways*/
 .long 0
-.long 640
-.long 480
-.long 32
+.long 1<<32 - MULTIBOOT2_MAGIC - MULTIBOOT2_ARCHITECTURE
+
+/*Framebuffer tag*/
+.align 8
+.short 5 /* type 5 */
+.short 0 /* Don't ignore me */
+.long 20 /* size 20 */
+.long 640 /* 640 width */
+.long 480 /* 480 height */
+.long 24 /* 8 bits per channel */
+
+/*Terminator tag */
+.align 8
+.short 0
+.short 0
+.long 8
 
 /*
 The multiboot standard does not define the value of the stack pointer register

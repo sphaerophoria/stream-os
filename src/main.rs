@@ -29,7 +29,7 @@ mod interrupts;
 mod framebuffer;
 mod io;
 mod libc;
-mod multiboot;
+mod multiboot2;
 mod net;
 mod rng;
 mod rtl8139;
@@ -39,6 +39,7 @@ mod util;
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use futures::future::Either;
+use multiboot2::Multiboot2;
 
 use core::{
     arch::global_asm,
@@ -53,7 +54,6 @@ use crate::{
     future::Executor,
     interrupts::{InitInterruptError, InterruptHandlerData},
     io::{io_allocator::IoAllocator, pci::Pci, ps2::Ps2Keyboard, rtc::Rtc, serial::Serial},
-    multiboot::MultibootInfo,
     net::{
         tcp::Tcp, ArpFrame, ArpFrameParams, ArpOperation, EtherType, EthernetFrameParams,
         ParsedIpv4Frame, ParsedPacket, UnknownArpOperation,
@@ -85,12 +85,12 @@ struct EarlyInitHandles {
 }
 
 unsafe fn interrupt_guarded_init(
-    info: *const MultibootInfo,
+    info: &Multiboot2,
 ) -> Result<EarlyInitHandles, InitInterruptError> {
     let _guard = InterruptGuarded::new(());
     let _guard = _guard.lock();
 
-    allocator::init(&*info);
+    allocator::init(info);
     logger::init(Default::default());
     let mut io_allocator = io::io_allocator::IoAllocator::new();
     let serial = Arc::new(Serial::new(&mut io_allocator).expect("Failed to initialize serial"));
@@ -192,12 +192,14 @@ struct Kernel {
 }
 
 impl Kernel {
-    unsafe fn init(info: *const MultibootInfo) -> Result<Kernel, InitInterruptError> {
+    unsafe fn init(multiboot_magic: u32, info: *const u8) -> Result<Kernel, InitInterruptError> {
+        let info = Multiboot2::new(multiboot_magic, info);
+
         let EarlyInitHandles {
             mut io_allocator,
             serial,
             interrupt_handlers,
-        } = interrupt_guarded_init(info)?;
+        } = interrupt_guarded_init(&info)?;
 
         let monotonic_time = Arc::new(MonotonicTime::new(Rtc::tick_freq()));
         let (wakeup_requester, wakeup_service, mut interrupt_wakeups) =
@@ -225,11 +227,11 @@ impl Kernel {
         let rng = Mutex::new(Rng::new(rtc.read().unwrap().seconds as u64));
         let tcp = Tcp::new(Arc::clone(&monotonic_time), wakeup_requester.clone());
 
-        let framebuffer = FrameBuffer::new(
-            (*info)
-                .get_framebuffer_info()
-                .expect("Failed to initialize framebuffer"),
-        );
+        let framebuffer_info = info
+            .get_framebuffer_info()
+            .expect("Failed to get framebuffer info");
+
+        let framebuffer = FrameBuffer::new(framebuffer_info);
 
         let ps2 = Ps2Keyboard::new(&mut io_allocator, interrupt_handlers);
 
@@ -579,8 +581,8 @@ async unsafe fn test_and_wait(monotonic_time: Arc<MonotonicTime>) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn kernel_main(_multiboot_magic: u32, info: *const MultibootInfo) -> i32 {
-    let mut kernel = Kernel::init(info).expect("Failed to initialize kernel");
+pub unsafe extern "C" fn kernel_main(multiboot_magic: u32, info: *const u8) -> i32 {
+    let mut kernel = Kernel::init(multiboot_magic, info).expect("Failed to initialize kernel");
 
     #[cfg(test)]
     {

@@ -1,4 +1,4 @@
-use crate::multiboot::FrameBufferInfo;
+use crate::multiboot2::FrameBufferInfo;
 
 #[derive(Copy, Clone)]
 pub struct Color(u32);
