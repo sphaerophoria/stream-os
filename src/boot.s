@@ -25,7 +25,7 @@ forced to be within the first 8 KiB of the kernel file.
 .long 20 /* size 20 */
 .long 640 /* 640 width */
 .long 480 /* 480 height */
-.long 24 /* 8 bits per channel */
+.long 32 /* 8 bits per channel */
 
 /*Terminator tag */
 .align 8
