@@ -31,6 +31,7 @@ mod framebuffer;
 mod io;
 mod libc;
 mod multiboot2;
+mod multiprocessing;
 mod net;
 mod rng;
 mod rtl8139;
@@ -51,11 +52,12 @@ use core::{
 use hashbrown::HashMap;
 
 use crate::{
-    acpi::{AcpiTable, MadtEntry},
+    acpi::AcpiTable,
     framebuffer::FrameBuffer,
     future::Executor,
     interrupts::{InitInterruptError, InterruptHandlerData},
     io::{io_allocator::IoAllocator, pci::Pci, ps2::Ps2Keyboard, rtc::Rtc, serial::Serial},
+    multiprocessing::CpuFnDispatcher,
     net::{
         tcp::Tcp, ArpFrame, ArpFrameParams, ArpOperation, EtherType, EthernetFrameParams,
         ParsedIpv4Frame, ParsedPacket, UnknownArpOperation,
@@ -177,6 +179,7 @@ impl ArpTable {
 
 #[allow(unused)]
 struct Kernel {
+    cpu_dispatcher: CpuFnDispatcher,
     io_allocator: IoAllocator,
     interrupt_handlers: &'static InterruptHandlerData,
     rng: Mutex<Rng>,
@@ -252,13 +255,12 @@ impl Kernel {
             })
             .expect("Failed to find madt");
 
-        info!("Local apic addr: {:?}", madt.local_apic_addr());
-        for entry in madt.entries() {
-            let MadtEntry::LocalApic { apic_id, .. } = entry;
-            info!("Found madt entry with apic id: {}", apic_id);
-        }
+        multiprocessing::boot_all_cpus(madt, &monotonic_time);
+
+        let cpu_dispatcher = CpuFnDispatcher::new().expect("Cpu dispatcher construction failed");
 
         Ok(Kernel {
+            cpu_dispatcher,
             interrupt_handlers,
             io_allocator,
             rtc,
@@ -386,6 +388,17 @@ impl Kernel {
             &self.wakeup_requester,
         );
 
+        let run_function_on_cpu = async {
+            for cpu in self.cpu_dispatcher.cpus().await {
+                self.cpu_dispatcher
+                    .execute(cpu, || {
+                        info!("Hello from cpu: {}", multiprocessing::cpuid());
+                    })
+                    .await
+                    .unwrap();
+            }
+        };
+
         let mut executor = Executor::new();
         executor.spawn(logger::service());
         executor.spawn(init_demo);
@@ -394,8 +407,10 @@ impl Kernel {
         executor.spawn(tcp_service);
         executor.spawn(send_udp);
         executor.spawn(game.run());
+        executor.spawn(run_function_on_cpu);
         executor.spawn(self.wakeup_service.service());
         executor.spawn(self.rtl8139.service());
+        executor.spawn(self.cpu_dispatcher.service());
         executor.run();
 
         info!("And now we exit/halt");

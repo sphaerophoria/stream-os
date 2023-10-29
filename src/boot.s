@@ -33,24 +33,27 @@ forced to be within the first 8 KiB of the kernel file.
 .short 0
 .long 8
 
-/*
-The multiboot standard does not define the value of the stack pointer register
-(esp) and it is up to the kernel to provide a stack. This allocates room for a
-small stack by creating a symbol at the bottom of it, then allocating 16384
-bytes for it, and finally creating a symbol at the top. The stack grows
-downwards on x86. The stack is in its own section so it can be marked nobits,
-which means the kernel file is smaller because it does not contain an
-uninitialized stack. The stack on x86 must be 16-byte aligned according to the
-System V ABI standard and de-facto extensions. The compiler will assume the
-stack is properly aligned and failure to align the stack will result in
-undefined behavior.
-*/
+.set MAX_NUM_CPUS, 8
+.set STACK_SIZE, 16384
+
 .section .bss
 .align 16
 stack_bottom:
-.skip 16380 # 16 KiB - 4 bytes
+.skip STACK_SIZE * MAX_NUM_CPUS
 stack_top:
 .skip 4 # We define stack top as the last element in our stack, but this is after all allocated space. Add another 4 bytes for one more element
+
+/* clobbers eax, ebx, ecx, edx, and esp */
+.macro set_cpu_stack
+    mov     $1, %eax
+    cpuid
+    shrl    $24, %ebx
+    add     $1, %ebx
+    mov     $STACK_SIZE, %eax
+    mul     %ebx
+    add     $stack_bottom, %eax
+    mov     %eax, %esp
+.endmacro
 
 /*
 The linker script specifies _start as the entry point to the kernel and the
@@ -61,33 +64,22 @@ doesn't make sense to return from this function as the bootloader is gone.
 .global _start
 .type _start, @function
 _start:
-	/*
-	The bootloader has loaded us into 32-bit protected mode on a x86
-	machine. Interrupts are disabled. Paging is disabled. The processor
-	state is as defined in the multiboot standard. The kernel has full
-	control of the CPU. The kernel can only make use of hardware features
-	and any code it provides as part of itself. There's no printf
-	function, unless the kernel provides its own <stdio.h> header and a
-	printf implementation. There are no security restrictions, no
-	safeguards, no debugging mechanisms, only what the kernel provides
-	itself. It has absolute and complete power over the
-	machine.
-	*/
+	/* Stash multiboot info before clobbering registers when setting up our
+	 * stack. Note that while we do not know which section of our stack we
+	 * want to use for this CPU, we are still writing to valid memory. Our
+	 * other CPUs haven't booted yet, so if we're wrong we don't care */
+	mov %eax,stack_top
+	mov %ebx,stack_top - 4
 
-	/*
-	To set up a stack, we set the esp register to point to the top of the
-	stack (as it grows downwards on x86 systems). This is necessarily done
-	in assembly as languages such as C cannot function without a stack.
-	*/
-	mov $stack_top, %esp
+	set_cpu_stack
 
-	/*
-	Multiboot info
-	kernel_main expects multiboot magic, multiboot info
-	Multiboot spec says those come in eax, ebx, push in reverse order before calling
-	*/
+	/* Pull multiboot info back from where we put it, and push it to the
+	 * stack where we wanted it*/
+	mov (stack_top), %eax
+	mov (stack_top - 4), %ebx
 	push %ebx
 	push %eax
+
 
 	/*
 	Enter the high-level kernel. The ABI requires the stack is 16-byte
@@ -115,8 +107,70 @@ _start:
 1:	hlt
 	jmp 1b
 
+
 /*
 Set the size of the _start symbol to the current location '.' minus its start.
 This is useful when debugging or when you implement call tracing.
 */
 .size _start, . - _start
+
+
+.global ap_trampoline
+.type ap_trampoline, @function
+
+/* Loaded to 0x8000 at runtime */
+.set LGDT_ADDR, load_gdt - ap_trampoline + 0x8000
+.set GDT_ADDR, GDT_value - ap_trampoline + 0x8000
+.set AP_PROTECTED_CODE_ADDR, ap_trampoline_protected - ap_trampoline + 0x8000
+/* Trampoline starts in real mode */
+    .code16
+ap_trampoline:
+    cli
+    cld
+    ljmp    $0, $LGDT_ADDR
+    .align 16
+GDT_table:
+    /* Values for GDT table were stolen from our calculated GDT in gdt::init()
+     * in rust code. I assume _this_ table has to be in low memory, as we only
+     * have 16 bits to work with. It might make more sense for us to initialize
+     * the GDT in rust code and then copy it to 0x8000 - GDT_size or something,
+     * but this is good enough for now */
+    .long  0x0, 0x0
+    .long  0xffff, 0xcf9900
+    .long  0xffff, 0xcf9300
+GDT_value:
+    .word GDT_value - GDT_table - 1
+    .long GDT_table - ap_trampoline + 0x8000
+    .long 0, 0
+    .align 64
+load_gdt:
+    /* Load gdt */
+    xorw    %ax, %ax
+    movw    %ax, %ds
+    lgdtl   GDT_ADDR
+
+    /* Move into protected mode */
+    movl    %cr0, %eax
+    orl     $1, %eax
+    movl    %eax, %cr0
+
+    ljmp    $8, $AP_PROTECTED_CODE_ADDR
+    .align 32
+    .code32
+ap_trampoline_protected:
+    movw    $16, %ax
+    movw    %ax, %ds
+    movw    %ax, %ss
+    set_cpu_stack
+    ljmp    $8, $ap_startup
+ap_trampoline_end:
+
+.data
+.global ap_trampoline_size
+.align 4
+ap_trampoline_size:
+    .long ap_trampoline_end - ap_trampoline
+.global max_num_cpus
+max_num_cpus:
+    .long MAX_NUM_CPUS
+

@@ -7,7 +7,7 @@ pub struct AtomicCell<T> {
 }
 
 impl<T> AtomicCell<T> {
-    pub fn new() -> AtomicCell<T> {
+    pub const fn new() -> AtomicCell<T> {
         AtomicCell {
             val: AtomicPtr::new(core::ptr::null_mut()),
         }
