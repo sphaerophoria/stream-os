@@ -26,6 +26,7 @@ mod game;
 mod gdt;
 #[macro_use]
 mod interrupts;
+mod acpi;
 mod framebuffer;
 mod io;
 mod libc;
@@ -50,6 +51,7 @@ use core::{
 use hashbrown::HashMap;
 
 use crate::{
+    acpi::{AcpiTable, MadtEntry},
     framebuffer::FrameBuffer,
     future::Executor,
     interrupts::{InitInterruptError, InterruptHandlerData},
@@ -234,6 +236,27 @@ impl Kernel {
         let framebuffer = FrameBuffer::new(framebuffer_info);
 
         let ps2 = Ps2Keyboard::new(&mut io_allocator, interrupt_handlers);
+
+        let rsdp = info.get_rsdp().expect("Failed to get rsdp");
+        if !rsdp.validate_checksum() {
+            panic!("Invalid rdsp");
+        }
+
+        let rsdt = rsdp.rsdt();
+
+        let madt = rsdt
+            .iter()
+            .find_map(|item| match item.upgrade() {
+                AcpiTable::Madt(madt) => Some(madt),
+                _ => None,
+            })
+            .expect("Failed to find madt");
+
+        info!("Local apic addr: {:?}", madt.local_apic_addr());
+        for entry in madt.entries() {
+            let MadtEntry::LocalApic { apic_id, .. } = entry;
+            info!("Found madt entry with apic id: {}", apic_id);
+        }
 
         Ok(Kernel {
             interrupt_handlers,

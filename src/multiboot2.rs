@@ -1,3 +1,7 @@
+use crate::acpi::Rsdp;
+
+use core::marker::PhantomData;
+
 #[repr(C)]
 struct BootInfoHeader {
     total_size: u32,
@@ -67,19 +71,29 @@ struct FrameBufferInfoPriv {
 }
 
 #[derive(Debug)]
-enum Tag {
-    MemoryMap(&'static MemoryMap),
-    FrameBufferInfo(&'static FrameBufferInfoPriv),
-    ImageLoad(&'static ImageLoad),
+#[repr(C)]
+struct RdspTag {
+    typ: u32,
+    size: u32,
+    descriptor: Rsdp,
 }
 
-struct TagIterator {
+#[derive(Debug)]
+enum Tag<'a> {
+    MemoryMap(&'a MemoryMap),
+    FrameBufferInfo(&'a FrameBufferInfoPriv),
+    Rsdp(&'a RdspTag),
+    ImageLoad(&'a ImageLoad),
+}
+
+struct TagIterator<'a> {
     loc: *const u8,
     end: *const u8,
+    _phantom: PhantomData<&'a ()>,
 }
 
-impl Iterator for TagIterator {
-    type Item = Tag;
+impl<'a> Iterator for TagIterator<'a> {
+    type Item = Tag<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         unsafe {
@@ -100,6 +114,7 @@ impl Iterator for TagIterator {
                         return Some(Tag::MemoryMap(map));
                     }
                     8 => return Some(Tag::FrameBufferInfo(&*(item as *const FrameBufferInfoPriv))),
+                    14 => return Some(Tag::Rsdp(&*(item as *const RdspTag))),
                     21 => return Some(Tag::ImageLoad(&*(item as *const ImageLoad))),
                     _ => (),
                 }
@@ -109,13 +124,17 @@ impl Iterator for TagIterator {
 }
 
 impl BootInfoHeader {
-    fn tags(&self) -> impl Iterator<Item = Tag> {
+    fn tags(&self) -> impl Iterator<Item = Tag<'_>> {
         unsafe {
             let header_addr = self as *const BootInfoHeader;
             let loc = header_addr.add(1) as *const u8;
             let end = (header_addr as *const u8).add((*header_addr).total_size as usize);
 
-            TagIterator { loc, end }
+            TagIterator {
+                loc,
+                end,
+                _phantom: PhantomData,
+            }
         }
     }
 }
@@ -143,6 +162,16 @@ impl Multiboot2 {
         let info = info as *const BootInfoHeader;
 
         Multiboot2 { info }
+    }
+
+    pub unsafe fn get_rsdp(&self) -> Option<&'_ Rsdp> {
+        for tag in (*self.info).tags() {
+            if let Tag::Rsdp(p) = tag {
+                return Some(&p.descriptor);
+            }
+        }
+
+        None
     }
 
     pub unsafe fn get_framebuffer_info(&self) -> Option<FrameBufferInfo> {
