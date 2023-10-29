@@ -45,11 +45,11 @@ pub fn init_late(io_allocator: &mut IoAllocator) {
             .expect("Failed to get exit port"),
     );
 
-    EXIT_PORT.store(Box::leak(port), Ordering::Relaxed);
+    EXIT_PORT.store(Box::leak(port), Ordering::Release);
 }
 
 pub unsafe fn exit(code: u8) {
-    let port = EXIT_PORT.load(Ordering::Relaxed);
+    let port = EXIT_PORT.load(Ordering::Acquire);
     if port.is_null() {
         return;
     }
