@@ -390,9 +390,12 @@ impl Kernel {
 
         let run_function_on_cpu = async {
             for cpu in self.cpu_dispatcher.cpus().await {
+                let time = Arc::clone(&self.monotonic_time);
                 self.cpu_dispatcher
-                    .execute(cpu, || {
+                    .execute(cpu, move || loop {
                         info!("Hello from cpu: {}", multiprocessing::cpuid());
+                        let end = (time.get() as f32 + 0.1 * time.tick_freq()) as usize;
+                        while time.get() < end {}
                     })
                     .await
                     .unwrap();

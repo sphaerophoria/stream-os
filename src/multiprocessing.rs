@@ -365,8 +365,11 @@ impl CpuFnDispatcher {
     }
 }
 
+pub const BSP_ID: u8 = 0;
+
 pub fn boot_all_cpus(madt: &Madt, time: &MonotonicTime) {
     let bsp_id = cpuid();
+    assert_eq!(bsp_id, BSP_ID);
     prepare_trampoline();
 
     for entry in madt.entries() {

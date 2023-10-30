@@ -1,4 +1,7 @@
-use crate::multiboot2::Multiboot2;
+use crate::{
+    multiboot2::Multiboot2,
+    util::{interrupt_guard::InterruptGuarded, spinlock::SpinLock},
+};
 
 use core::{
     alloc::{GlobalAlloc, Layout},
@@ -56,12 +59,14 @@ impl UsedSegment {
 
 pub struct Allocator {
     pub first_free: AtomicPtr<FreeSegment>,
+    lock: SpinLock<()>,
 }
 
 impl Allocator {
     pub const fn new() -> Allocator {
         Allocator {
             first_free: AtomicPtr::new(core::ptr::null_mut()),
+            lock: SpinLock::new(()),
         }
     }
 }
@@ -160,6 +165,10 @@ unsafe fn convert_used_to_free_segment(list_head: *mut FreeSegment, header_ptr: 
 
 unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let _guard1 = InterruptGuarded::new(());
+        let _guard1 = _guard1.lock();
+        let _guard2 = self.lock.lock();
+
         let mut free_block_it = self.first_free.load(Ordering::Relaxed);
 
         while !free_block_it.is_null() {
@@ -185,6 +194,10 @@ unsafe impl GlobalAlloc for Allocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+        let _guard1 = InterruptGuarded::new(());
+        let _guard1 = _guard1.lock();
+        let _guard2 = self.lock.lock();
+
         let header_ptr = get_header_ptr_from_allocated(ptr);
         convert_used_to_free_segment(self.first_free.load(Ordering::Relaxed), header_ptr);
     }

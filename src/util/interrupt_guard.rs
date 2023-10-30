@@ -5,6 +5,8 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use crate::multiprocessing;
+
 static NUM_GUARDS: AtomicUsize = AtomicUsize::new(0);
 
 pub struct InterruptGuard<'a, T> {
@@ -13,7 +15,9 @@ pub struct InterruptGuard<'a, T> {
 
 impl<'a, T> Drop for InterruptGuard<'a, T> {
     fn drop(&mut self) {
-        if NUM_GUARDS.fetch_sub(1, Ordering::SeqCst) == 1 {
+        if multiprocessing::cpuid() == multiprocessing::BSP_ID
+            && NUM_GUARDS.fetch_sub(1, Ordering::SeqCst) == 1
+        {
             unsafe {
                 asm!("sti");
             }
@@ -47,10 +51,12 @@ impl<T> InterruptGuarded<T> {
     }
 
     pub fn lock(&self) -> InterruptGuard<'_, T> {
-        NUM_GUARDS.fetch_add(1, Ordering::SeqCst);
+        if multiprocessing::cpuid() == multiprocessing::BSP_ID {
+            NUM_GUARDS.fetch_add(1, Ordering::SeqCst);
 
-        unsafe {
-            asm!("cli");
+            unsafe {
+                asm!("cli");
+            }
         }
 
         unsafe {
