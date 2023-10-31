@@ -7,8 +7,8 @@ use hashbrown::{HashMap, HashSet};
 use alloc::{boxed::Box, sync::Arc, task::Wake};
 
 struct KernelWaker {
-    id: u64,
-    tx: Sender<u64>,
+    id: TaskId,
+    tx: Sender<TaskId>,
 }
 
 impl Wake for KernelWaker {
@@ -22,18 +22,21 @@ struct Task<'a> {
     waker: Arc<KernelWaker>,
 }
 
+#[derive(Clone, Debug, Copy, Hash, Eq, PartialEq)]
+pub struct TaskId(u64);
+
 pub struct Executor<'a> {
-    id: u64,
-    tasks: HashMap<u64, Task<'a>>,
-    to_run: Receiver<u64>,
-    queue_to_run: Sender<u64>,
+    id: TaskId,
+    tasks: HashMap<TaskId, Task<'a>>,
+    to_run: Receiver<TaskId>,
+    queue_to_run: Sender<TaskId>,
 }
 
 impl<'a> Executor<'a> {
     pub fn new() -> Executor<'a> {
         let (queue_to_run, to_run) = lock_free_queue::channel(1024);
         Executor {
-            id: 0,
+            id: TaskId(0),
             tasks: Default::default(),
             to_run,
             queue_to_run,
@@ -42,7 +45,7 @@ impl<'a> Executor<'a> {
 
     pub fn spawn<F: Future<Output = ()> + 'a + Send>(&mut self, fut: F) {
         let id = self.id;
-        self.id += 1;
+        self.id.0 += 1;
 
         let waker = Arc::new(KernelWaker {
             id,
@@ -82,7 +85,7 @@ impl<'a> Executor<'a> {
                 let task = match self.tasks.get_mut(&task_id) {
                     Some(v) => v,
                     None => {
-                        error!("Failed to get task {task_id}");
+                        error!("Failed to get task {task_id:?}");
                         continue;
                     }
                 };
