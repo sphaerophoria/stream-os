@@ -1,5 +1,4 @@
 use crate::{
-    acpi::{Madt, MadtEntry},
     time::MonotonicTime,
     util::{
         async_mutex::Mutex,
@@ -25,6 +24,73 @@ extern "C" {
     static ap_trampoline_size: u32;
     fn ap_trampoline();
 }
+
+// FIXME: This is not a good assumption, and may very well not be true
+pub const APIC_ADDR: *mut u8 = 0xfee00000 as *mut u8;
+pub const WAKEUP_IRQ_ID: u8 = 0x90;
+
+pub struct Apic {
+    inner: *mut u8,
+}
+
+impl Apic {
+    pub fn new(ptr: *mut u8) -> Apic {
+        Apic { inner: ptr }
+    }
+
+    unsafe fn icr_high(&self) -> *mut u32 {
+        self.inner.add(0x310) as *mut u32
+    }
+
+    unsafe fn icr_low(&self) -> *mut u32 {
+        self.inner.add(0x300) as *mut u32
+    }
+
+    pub unsafe fn boot_apic(&mut self, id: u8, time: &MonotonicTime) {
+        let icr_high = self.icr_high();
+        let icr_low = self.icr_low();
+
+        send_init_ipi(id, icr_high, icr_low);
+        send_deinit_ipi(id, icr_high, icr_low);
+
+        // NOTE: There are some missed checks in here, and timing is not correct
+        busy_wait(0.1, time);
+        send_startup_ipi(id, icr_high, icr_low);
+        busy_wait(0.1, time);
+        send_startup_ipi(id, icr_high, icr_low);
+    }
+
+    pub unsafe fn send_ipi(&mut self, cpu_id: u8, interrupt_num: u8) {
+        let icr_high = self.icr_high();
+        let icr_low = self.icr_low();
+        select_ap(cpu_id, icr_high);
+
+        let command = InterruptCommand {
+            delivery_status: DeliveryStatus::Idle,
+            level: Level::Deassert,
+            destination_mode: DestinationMode::Physical,
+            destination_shorthand: DestinationShorthand::None,
+            trigger_mode: TriggerMode::Edge,
+            delivery_mode: DeliveryMode::Fixed,
+            vector: interrupt_num,
+        };
+        let low_val = icr_low.read_volatile();
+        icr_low.write_volatile(command.to_u32(low_val));
+    }
+
+    pub unsafe fn write_eoi(&self) {
+        let eoi = self.inner.add(0xb0) as *mut u32;
+        eoi.write_volatile(0);
+    }
+
+    pub unsafe fn enable_interrupts(&self) {
+        let siv = self.inner.add(0xf0) as *mut u32;
+        let val = siv.read_volatile() | 0x100;
+        siv.write_volatile(val);
+    }
+}
+
+unsafe impl Send for Apic {}
 
 pub fn cpuid() -> u8 {
     let mut ebx: u32;
@@ -215,22 +281,6 @@ unsafe fn busy_wait(time_s: f32, time: &MonotonicTime) {
     while time.get() < end_time {}
 }
 
-pub fn boot_apic(id: u8, apic_ptr: *mut u8, time: &MonotonicTime) {
-    unsafe {
-        let icr_high = apic_ptr.add(0x310) as *mut u32;
-        let icr_low = apic_ptr.add(0x300) as *mut u32;
-
-        send_init_ipi(id, icr_high, icr_low);
-        send_deinit_ipi(id, icr_high, icr_low);
-
-        // NOTE: There are some missed checks in here, and timing is not correct
-        busy_wait(0.1, time);
-        send_startup_ipi(id, icr_high, icr_low);
-        busy_wait(0.1, time);
-        send_startup_ipi(id, icr_high, icr_low);
-    }
-}
-
 pub fn prepare_trampoline() {
     unsafe {
         // Why would we do this?
@@ -257,6 +307,13 @@ static BOOT_INFO_QUEUE: SpinLock<VecDeque<BootInfo>> = SpinLock::new(VecDeque::n
 
 #[no_mangle]
 pub extern "C" fn ap_startup() {
+    unsafe {
+        crate::interrupts::load_idt();
+        core::arch::asm!("sti");
+        let apic = Apic::new(APIC_ADDR);
+        apic.enable_interrupts();
+    }
+
     let fn_queue = Arc::new(SpinLock::new(FnQueue::new()));
 
     let cpu_id = cpuid();
@@ -276,12 +333,16 @@ pub extern "C" fn ap_startup() {
     info!("cpu {cpu_id} booted");
 
     loop {
-        let mut fns = fn_queue.lock();
-        if let Some(f) = fns.pop_front() {
-            f();
+        {
+            let mut fns = fn_queue.lock();
+            if let Some(f) = fns.pop_front() {
+                f();
+            }
         }
 
-        // FIXME: Halt cpu and wait for something interesting to happen
+        unsafe {
+            core::arch::asm!("hlt");
+        }
     }
 }
 
@@ -296,10 +357,14 @@ static WAKER: AtomicCell<Waker> = AtomicCell::new();
 
 pub struct CpuFnDispatcher {
     cpus: Mutex<HashMap<u32, SharedFnQueue>>,
+    apic: Mutex<Apic>,
 }
 
+unsafe impl Sync for CpuFnDispatcher {}
+unsafe impl Send for CpuFnDispatcher {}
+
 impl CpuFnDispatcher {
-    pub fn new() -> Result<CpuFnDispatcher, CpuFnDispatcherError> {
+    pub fn new(apic: Apic) -> Result<CpuFnDispatcher, CpuFnDispatcherError> {
         loop {
             let active = DISPATCHER_ACTIVE.load(Ordering::Relaxed);
 
@@ -317,6 +382,7 @@ impl CpuFnDispatcher {
 
         Ok(CpuFnDispatcher {
             cpus: Mutex::new(HashMap::new()),
+            apic: Mutex::new(apic),
         })
     }
 
@@ -335,6 +401,9 @@ impl CpuFnDispatcher {
         let queue = cpus.get(&cpu_id).ok_or(ExecuteError)?;
         let mut queue = queue.lock();
         queue.push_back(Box::new(f));
+        unsafe {
+            self.apic.lock().await.send_ipi(cpu_id as u8, WAKEUP_IRQ_ID);
+        }
         Ok(())
     }
 
@@ -367,14 +436,12 @@ impl CpuFnDispatcher {
 
 pub const BSP_ID: u8 = 0;
 
-pub fn boot_all_cpus(madt: &Madt, time: &MonotonicTime) {
+pub fn boot_all_cpus(apic: &mut Apic, apic_ids: impl Iterator<Item = u8>, time: &MonotonicTime) {
     let bsp_id = cpuid();
     assert_eq!(bsp_id, BSP_ID);
     prepare_trampoline();
 
-    for entry in madt.entries() {
-        let MadtEntry::LocalApic { apic_id, .. } = entry;
-
+    for apic_id in apic_ids {
         unsafe {
             if apic_id as u32 >= max_num_cpus {
                 error!("Cannot boot processor with ID {apic_id} >= {max_num_cpus}");
@@ -383,7 +450,9 @@ pub fn boot_all_cpus(madt: &Madt, time: &MonotonicTime) {
         }
 
         if apic_id != bsp_id {
-            crate::multiprocessing::boot_apic(apic_id, madt.local_apic_addr(), time);
+            unsafe {
+                apic.boot_apic(apic_id, time);
+            }
         }
     }
 }

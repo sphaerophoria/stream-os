@@ -39,9 +39,11 @@ mod sleep;
 mod time;
 mod util;
 
+use acpi::MadtEntry;
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use futures::future::Either;
 use multiboot2::Multiboot2;
+use multiprocessing::Apic;
 
 use core::{
     arch::global_asm,
@@ -220,6 +222,13 @@ impl Kernel {
             }
         };
 
+        interrupt_handlers
+            .register(
+                interrupts::IrqId::Internal(multiprocessing::WAKEUP_IRQ_ID),
+                || {},
+            )
+            .expect("Failed to register empty interrupt handler");
+
         let mut rtc = io::rtc::Rtc::new(&mut io_allocator, interrupt_handlers, on_tick)
             .expect("Failed to construct rtc");
 
@@ -255,9 +264,18 @@ impl Kernel {
             })
             .expect("Failed to find madt");
 
-        multiprocessing::boot_all_cpus(madt, &monotonic_time);
+        let mut apic = Apic::new(madt.local_apic_addr());
+        multiprocessing::boot_all_cpus(
+            &mut apic,
+            madt.entries().map(|x| {
+                let MadtEntry::LocalApic { apic_id, .. } = x;
+                apic_id
+            }),
+            &monotonic_time,
+        );
 
-        let cpu_dispatcher = CpuFnDispatcher::new().expect("Cpu dispatcher construction failed");
+        let cpu_dispatcher =
+            CpuFnDispatcher::new(apic).expect("Cpu dispatcher construction failed");
 
         Ok(Kernel {
             cpu_dispatcher,
@@ -390,12 +408,21 @@ impl Kernel {
 
         let run_function_on_cpu = async {
             for cpu in self.cpu_dispatcher.cpus().await {
-                let time = Arc::clone(&self.monotonic_time);
                 self.cpu_dispatcher
-                    .execute(cpu, move || loop {
+                    .execute(cpu, move || {
                         info!("Hello from cpu: {}", multiprocessing::cpuid());
-                        let end = (time.get() as f32 + 0.1 * time.tick_freq()) as usize;
-                        while time.get() < end {}
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            info!("Sleeping for 5s before waking up CPUs again");
+            sleep::sleep(5.0, &self.monotonic_time, &self.wakeup_requester).await;
+
+            for cpu in self.cpu_dispatcher.cpus().await {
+                self.cpu_dispatcher
+                    .execute(cpu, move || {
+                        info!("Hello from cpu {} again", multiprocessing::cpuid());
                     })
                     .await
                     .unwrap();

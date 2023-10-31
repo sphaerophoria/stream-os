@@ -1,13 +1,18 @@
 use crate::{
     io::io_allocator::{IoAllocator, IoOffset, IoRange, OffsetOutOfRange},
+    multiprocessing::{self, Apic},
     util::bit_manipulation::SetBits,
     util::interrupt_guard::InterruptGuarded,
 };
 use alloc::{boxed::Box, vec::Vec};
-use core::arch::asm;
+use core::{
+    arch::asm,
+    sync::atomic::{AtomicPtr, Ordering},
+};
 use hashbrown::HashMap;
 
 static INTERRUPT_HANDLER_DATA: InterruptHandlerData = InterruptHandlerData::new();
+static GATE_DESCRIPTORS: AtomicPtr<GateDescriptor> = AtomicPtr::new(core::ptr::null_mut());
 
 const PIC_COMMAND_OFFSET: IoOffset = IoOffset::new(0);
 const PIC_DATA_OFFSET: IoOffset = IoOffset::new(1);
@@ -132,6 +137,15 @@ extern "C" fn generic_interrupt_handler(interrupt_number: u8) {
             }
         };
         f();
+
+        // Secondary processors use APIC not PIC
+        if multiprocessing::cpuid() != multiprocessing::BSP_ID {
+            let apic = Apic::new(multiprocessing::APIC_ADDR);
+            unsafe {
+                apic.write_eoi();
+            }
+            return Ok(());
+        }
 
         const END_OF_INTERRUPT: u8 = 0x20;
 
@@ -322,42 +336,44 @@ fn pic_disable_interrupts(pic_io: &mut PicIo) -> Result<(), DisableInterruptErro
     Ok(())
 }
 
-pub fn init(
-    io_allocator: &mut IoAllocator,
-) -> Result<&'static InterruptHandlerData, InitInterruptError> {
-    let pic1_io = io_allocator
-        .request_io_range(0x20, 2)
-        .ok_or(InitInterruptError::AcquirePic1)?;
-    let pic2_io = io_allocator
-        .request_io_range(0xA0, 2)
-        .ok_or(InitInterruptError::AcquirePic2)?;
+pub fn load_idt() {
+    if GATE_DESCRIPTORS.load(Ordering::Acquire).is_null() {
+        let mut table = Vec::with_capacity(255);
+        let mut isrs = Vec::with_capacity(255);
+        for i in 0..255 {
+            isrs.push(generate_interrupt_stub(i as u8));
 
-    let mut pic_io = PicIo { pic1_io, pic2_io };
+            let descriptor = GateDescriptor::new(GateDescriptorNewArgs {
+                #[allow(clippy::fn_to_numeric_cast)]
+                offset: isrs[i].as_ptr() as u32,
+                segment_selector: 0x08,
+                gate_type: 0b1111,
+                dpl: 0,
+                p: true,
+            });
 
-    pic_remap(PIC1_OFFSET, PIC2_OFFSET, &mut pic_io).map_err(InitInterruptError::RemapPic)?;
+            table.push(descriptor);
+        }
 
-    pic_disable_interrupts(&mut pic_io).map_err(InitInterruptError::DisableInterrupts)?;
-
-    let mut table = Vec::with_capacity(255);
-    let mut isrs = Vec::with_capacity(255);
-    for i in 0..255 {
-        isrs.push(generate_interrupt_stub(i as u8));
-
-        let descriptor = GateDescriptor::new(GateDescriptorNewArgs {
-            #[allow(clippy::fn_to_numeric_cast)]
-            offset: isrs[i].as_ptr() as u32,
-            segment_selector: 0x08,
-            gate_type: 0b1111,
-            dpl: 0,
-            p: true,
-        });
-
-        table.push(descriptor);
+        // FIXME: only generate one time
+        let table = table.leak();
+        let isrs = isrs.leak();
+        if GATE_DESCRIPTORS
+            .compare_exchange(
+                core::ptr::null_mut(),
+                table.as_mut_ptr(),
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            unsafe {
+                let _ = Box::from_raw(table);
+                let _ = Box::from_raw(isrs);
+            }
+        }
     }
-
-    let table = table.leak();
-    let _ = isrs.leak();
-    let table_ptr: *const GateDescriptor = table.as_ptr();
+    let table_ptr: *const GateDescriptor = GATE_DESCRIPTORS.load(Ordering::Acquire);
 
     let idt = Idt {
         size: 256 * 8 - 1,
@@ -374,6 +390,26 @@ pub fn init(
     }
 
     debug!("{:?}", read_idtr());
+}
+
+pub fn init(
+    io_allocator: &mut IoAllocator,
+) -> Result<&'static InterruptHandlerData, InitInterruptError> {
+    let pic1_io = io_allocator
+        .request_io_range(0x20, 2)
+        .ok_or(InitInterruptError::AcquirePic1)?;
+    let pic2_io = io_allocator
+        .request_io_range(0xA0, 2)
+        .ok_or(InitInterruptError::AcquirePic2)?;
+
+    let mut pic_io = PicIo { pic1_io, pic2_io };
+
+    pic_remap(PIC1_OFFSET, PIC2_OFFSET, &mut pic_io).map_err(InitInterruptError::RemapPic)?;
+
+    pic_disable_interrupts(&mut pic_io).map_err(InitInterruptError::DisableInterrupts)?;
+
+    load_idt();
+
     INTERRUPT_HANDLER_DATA.init(pic_io);
 
     Ok(&INTERRUPT_HANDLER_DATA)
