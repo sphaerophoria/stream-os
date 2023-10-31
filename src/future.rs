@@ -1,14 +1,21 @@
-use crate::util::lock_free_queue::{self, Receiver, Sender};
+use crate::{
+    multiprocessing::CpuFnDispatcher,
+    util::{
+        lock_free_queue::{self, Receiver, Sender},
+        spinlock::SpinLock,
+    },
+};
 
 use core::{
     future::Future,
     pin::Pin,
+    sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll},
 };
 
 use hashbrown::{HashMap, HashSet};
 
-use alloc::{boxed::Box, sync::Arc, task::Wake};
+use alloc::{boxed::Box, sync::Arc, task::Wake, vec::Vec};
 
 struct KernelWaker {
     id: TaskId,
@@ -22,7 +29,7 @@ impl Wake for KernelWaker {
 }
 
 struct Task<'a> {
-    future: Pin<Box<dyn Future<Output = ()> + 'a>>,
+    future: Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
     waker: Arc<KernelWaker>,
 }
 
@@ -30,18 +37,20 @@ struct Task<'a> {
 pub struct TaskId(u64);
 
 pub struct Executor<'a> {
+    cpu_dispatcher: Option<&'a CpuFnDispatcher>,
     id: TaskId,
-    tasks: HashMap<TaskId, Task<'a>>,
+    tasks: Arc<SpinLock<HashMap<TaskId, Task<'a>>>>,
     to_run: Receiver<TaskId>,
     queue_to_run: Sender<TaskId>,
 }
 
 impl<'a> Executor<'a> {
-    pub fn new() -> Executor<'a> {
+    pub fn new(dispatcher: Option<&'a CpuFnDispatcher>) -> Executor<'a> {
         let (queue_to_run, to_run) = lock_free_queue::channel(1024);
         Executor {
+            cpu_dispatcher: dispatcher,
             id: TaskId(0),
-            tasks: Default::default(),
+            tasks: Arc::new(SpinLock::new(Default::default())),
             to_run,
             queue_to_run,
         }
@@ -61,7 +70,7 @@ impl<'a> Executor<'a> {
             waker,
         };
 
-        self.tasks.insert(id, task);
+        self.tasks.lock().insert(id, task);
         self.queue_to_run
             .push(id)
             .expect("Failed to queue task on executor");
@@ -69,9 +78,18 @@ impl<'a> Executor<'a> {
 
     pub fn run(mut self) {
         loop {
-            if self.tasks.is_empty() {
+            if self.tasks.lock().is_empty() {
                 return;
             }
+
+            let cpus: Vec<_> = if let Some(cpu_dispatcher) = &self.cpu_dispatcher {
+                cpu_dispatcher
+                    .cpus()
+                    .map(|id| (id, Arc::new(AtomicBool::new(false))))
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
             let mut to_run = HashSet::new();
             while let Some(v) = self.to_run.pop() {
@@ -86,7 +104,7 @@ impl<'a> Executor<'a> {
             }
 
             for task_id in to_run {
-                let task = match self.tasks.get_mut(&task_id) {
+                let task = match self.tasks.lock().remove(&task_id) {
                     Some(v) => v,
                     None => {
                         error!("Failed to get task {task_id:?}");
@@ -94,11 +112,55 @@ impl<'a> Executor<'a> {
                     }
                 };
 
-                let context_waker = Arc::clone(&task.waker).into();
-                let mut context = core::task::Context::from_waker(&context_waker);
-                if task.future.as_mut().poll(&mut context).is_ready() {
-                    self.tasks.remove(&task_id);
+                // NOTE: We are casting to static lifetime, and guaranteeing that we do not exit
+                // this loop until all outgoing tasks have completed. This is dangerous, but the
+                // wait at the bottom of this loop for tasks to be completed should prevent any
+                // problems
+                let mut task = unsafe { core::mem::transmute::<Task<'a>, Task<'static>>(task) };
+                let tasks = unsafe {
+                    core::mem::transmute::<
+                        Arc<SpinLock<HashMap<TaskId, Task<'a>>>>,
+                        Arc<SpinLock<HashMap<TaskId, Task<'static>>>>,
+                    >(Arc::clone(&self.tasks))
+                };
+
+                let poll_fn = move || {
+                    let context_waker = Arc::clone(&task.waker).into();
+                    let mut context = core::task::Context::from_waker(&context_waker);
+                    if task.future.as_mut().poll(&mut context).is_pending() {
+                        tasks.lock().insert(task_id, task);
+                    }
+                };
+
+                let mut poll_fn = Some(poll_fn);
+
+                for (id, currently_executing) in &cpus {
+                    if currently_executing.load(Ordering::Relaxed) {
+                        continue;
+                    }
+
+                    currently_executing.store(true, Ordering::Relaxed);
+                    #[allow(clippy::needless_borrow)]
+                    let currently_executing = Arc::clone(&currently_executing);
+                    let poll_fn = core::mem::take(&mut poll_fn).expect("Poll fn should be valid");
+                    self.cpu_dispatcher
+                        .as_ref()
+                        .expect("Trying to dispatch to cpu when dispatcher does not exist")
+                        .execute(*id, move || {
+                            poll_fn();
+                            currently_executing.store(false, Ordering::Release);
+                        })
+                        .unwrap();
+                    break;
                 }
+
+                if let Some(poll_fn) = poll_fn {
+                    poll_fn();
+                }
+            }
+
+            for (_, currently_executing) in &cpus {
+                while currently_executing.load(Ordering::Acquire) {}
             }
         }
     }

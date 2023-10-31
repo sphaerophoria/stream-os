@@ -374,8 +374,9 @@ impl Kernel {
                 let data = connection.read().await;
 
                 info!(
-                    "Received TCP data: \"{}\"",
-                    core::str::from_utf8_unchecked(&data)
+                    "Received TCP data: \"{}\" on cpu {}",
+                    core::str::from_utf8_unchecked(&data),
+                    multiprocessing::cpuid()
                 );
 
                 match handle_http_request(&data) {
@@ -431,30 +432,7 @@ impl Kernel {
             &self.wakeup_requester,
         );
 
-        let run_function_on_cpu = async {
-            for cpu in self.cpu_dispatcher.cpus().await {
-                self.cpu_dispatcher
-                    .execute(cpu, move || {
-                        info!("Hello from cpu: {}", multiprocessing::cpuid());
-                    })
-                    .await
-                    .unwrap();
-            }
-
-            info!("Sleeping for 5s before waking up CPUs again");
-            sleep::sleep(5.0, &self.monotonic_time, &self.wakeup_requester).await;
-
-            for cpu in self.cpu_dispatcher.cpus().await {
-                self.cpu_dispatcher
-                    .execute(cpu, move || {
-                        info!("Hello from cpu {} again", multiprocessing::cpuid());
-                    })
-                    .await
-                    .unwrap();
-            }
-        };
-
-        let mut executor = Executor::new();
+        let mut executor = Executor::new(Some(&self.cpu_dispatcher));
         executor.spawn(logger::service());
         executor.spawn(init_demo);
         executor.spawn(recv);
@@ -462,7 +440,6 @@ impl Kernel {
         executor.spawn(tcp_service);
         executor.spawn(send_udp);
         executor.spawn(game.run());
-        executor.spawn(run_function_on_cpu);
         executor.spawn(self.wakeup_service.service());
         executor.spawn(self.rtl8139.service());
         executor.spawn(self.cpu_dispatcher.service());
@@ -748,7 +725,7 @@ pub unsafe extern "C" fn kernel_main(multiboot_magic: u32, info: *const u8) -> i
 
     #[cfg(test)]
     {
-        let mut executor = Executor::new();
+        let mut executor = Executor::new(None);
         executor.spawn(logger::service());
         executor.spawn(test_and_wait(Arc::clone(&kernel.monotonic_time)));
         executor.run();

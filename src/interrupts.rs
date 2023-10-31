@@ -133,7 +133,11 @@ extern "C" fn generic_interrupt_handler(interrupt_number: u8) {
         {
             Some(f) => f,
             None => {
-                panic!("no handler for interrupt {}", interrupt_number);
+                panic!(
+                    "no handler for interrupt {} on cpu {}",
+                    interrupt_number,
+                    multiprocessing::cpuid()
+                );
             }
         };
         f();

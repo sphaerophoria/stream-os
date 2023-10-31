@@ -1,7 +1,6 @@
 use crate::{
     time::MonotonicTime,
     util::{
-        async_mutex::Mutex,
         atomic_cell::AtomicCell,
         bit_manipulation::{GetBits, SetBits},
         spinlock::SpinLock,
@@ -308,6 +307,7 @@ static BOOT_INFO_QUEUE: SpinLock<VecDeque<BootInfo>> = SpinLock::new(VecDeque::n
 #[no_mangle]
 pub extern "C" fn ap_startup() {
     unsafe {
+        crate::gdt::init();
         crate::interrupts::load_idt();
         core::arch::asm!("sti");
         let apic = Apic::new(APIC_ADDR);
@@ -356,8 +356,8 @@ static DISPATCHER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static WAKER: AtomicCell<Waker> = AtomicCell::new();
 
 pub struct CpuFnDispatcher {
-    cpus: Mutex<HashMap<u32, SharedFnQueue>>,
-    apic: Mutex<Apic>,
+    cpus: SpinLock<HashMap<u32, SharedFnQueue>>,
+    apic: SpinLock<Apic>,
 }
 
 unsafe impl Sync for CpuFnDispatcher {}
@@ -381,28 +381,28 @@ impl CpuFnDispatcher {
         }
 
         Ok(CpuFnDispatcher {
-            cpus: Mutex::new(HashMap::new()),
-            apic: Mutex::new(apic),
+            cpus: SpinLock::new(HashMap::new()),
+            apic: SpinLock::new(apic),
         })
     }
 
-    pub async fn cpus(&self) -> impl Iterator<Item = u32> {
-        let cpus = self.cpus.lock().await;
+    pub fn cpus(&self) -> impl Iterator<Item = u32> {
+        let cpus = self.cpus.lock();
         let keys: alloc::vec::Vec<_> = cpus.keys().cloned().collect();
         keys.into_iter()
     }
 
-    pub async fn execute<F: FnOnce() + Send + 'static>(
+    pub fn execute<F: FnOnce() + Send + 'static>(
         &self,
         cpu_id: u32,
         f: F,
     ) -> Result<(), ExecuteError> {
-        let cpus = self.cpus.lock().await;
+        let cpus = self.cpus.lock();
         let queue = cpus.get(&cpu_id).ok_or(ExecuteError)?;
         let mut queue = queue.lock();
         queue.push_back(Box::new(f));
         unsafe {
-            self.apic.lock().await.send_ipi(cpu_id as u8, WAKEUP_IRQ_ID);
+            self.apic.lock().send_ipi(cpu_id as u8, WAKEUP_IRQ_ID);
         }
         Ok(())
     }
@@ -428,7 +428,7 @@ impl CpuFnDispatcher {
         loop {
             let info = BootInfoQueueAvailable.await;
             info!("Found boot info for cpu {}", info.id);
-            let mut cpus = self.cpus.lock().await;
+            let mut cpus = self.cpus.lock();
             cpus.insert(info.id, info.queue);
         }
     }

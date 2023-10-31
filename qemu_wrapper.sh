@@ -4,7 +4,7 @@ NOGRAPHIC=${NOGRAPHIC:-0}
 DUMP_NETWORK=${DUMP_NETWORK:-0}
 TAP_IF=${TAP_IF:-tap0}
 GDB=${GDB:-0}
-NUM_CORES=${NUM_CORES:-1}
+NUM_CORES=${NUM_CORES:-4}
 
 if [ "$NOGRAPHIC" == "0" ]; then
   STDIO_CMD="-serial stdio"

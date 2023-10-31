@@ -13,7 +13,7 @@ pub struct TestCase {
 
 pub fn test_runner(test_fns: &[&TestCase]) {
     let mut any_failed = false;
-    let mut executor = Executor::new();
+    let mut executor = Executor::new(None);
     executor.spawn(async {
         for test_case in test_fns {
             print!("{}... ", test_case.name);
