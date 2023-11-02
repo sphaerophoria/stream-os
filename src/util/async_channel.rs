@@ -82,7 +82,7 @@ mod test {
         tx.send(1).await;
         test_eq!(rx.recv().await, 1);
 
-        let recv_poll = futures::future::poll_fn(|cx| {
+        let recv_poll = crate::future::poll_fn(|cx| {
             let val = core::pin::pin!(rx.recv()).poll(cx);
             Poll::Ready(val)
         })

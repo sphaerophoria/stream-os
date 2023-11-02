@@ -39,9 +39,9 @@ mod sleep;
 mod time;
 mod util;
 
+use crate::future::Either;
 use acpi::MadtEntry;
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
-use futures::future::Either;
 use multiboot2::Multiboot2;
 use multiprocessing::Apic;
 
@@ -331,7 +331,7 @@ impl Kernel {
             let arp_lookup = self.arp_table.wait_for(&REMOTE_IP);
             let arp_lookup = core::pin::pin!(arp_lookup);
 
-            let mac = match futures::future::select(arp_lookup, sleep_fut).await {
+            let mac = match crate::future::select(arp_lookup, sleep_fut).await {
                 Either::Left((mac, _)) => mac,
                 Either::Right(_) => {
                     warn!("ARP lookup for {:?} failed", REMOTE_IP);

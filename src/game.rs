@@ -125,7 +125,7 @@ impl<'a> Game<'a> {
     }
 
     async fn handle_input(&mut self) {
-        let key = futures::future::poll_immediate(self.ps2.read()).await;
+        let key = crate::future::poll_immediate(self.ps2.read()).await;
 
         match key {
             Some(D_DOWN) => {

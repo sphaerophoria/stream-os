@@ -889,7 +889,7 @@ mod test {
             .await;
 
         // We should get a syn-ack response from the initial syn
-        if futures::future::poll_immediate(fixture.tcp.service())
+        if crate::future::poll_immediate(fixture.tcp.service())
             .await
             .is_some()
         {
@@ -901,7 +901,7 @@ mod test {
             .time
             .set_tick((fixture.time.tick_freq() * 2.0) as usize);
 
-        let syn_ack = match futures::future::poll_immediate(fixture.tcp.service()).await {
+        let syn_ack = match crate::future::poll_immediate(fixture.tcp.service()).await {
             Some(v) => v,
             None => return Err("Syn ack retransmit missing".into()),
         };
@@ -917,7 +917,7 @@ mod test {
             .handle_frame(&frame, &SOURCE_IP, &DEST_IP, &fixture.rng)
             .await;
 
-        if futures::future::poll_immediate(listener.connection())
+        if crate::future::poll_immediate(listener.connection())
             .await
             .is_none()
         {
@@ -949,14 +949,14 @@ mod test {
 
         mock_client.handshake(&fixture).await?;
 
-        let connection = futures::future::poll_immediate(listener.connection())
+        let connection = crate::future::poll_immediate(listener.connection())
             .await
             .ok_or("Connection not ready".to_string())?;
 
         connection.write(Arc::<str>::from("hello world")).await;
         connection.write(Arc::<str>::from("hello world 2")).await;
 
-        let frame = futures::future::poll_immediate(fixture.tcp.service())
+        let frame = crate::future::poll_immediate(fixture.tcp.service())
             .await
             .ok_or("tcp service did not return a value".to_string())?;
 
@@ -979,7 +979,7 @@ mod test {
 
         test_true!(response.is_none());
 
-        let frame = futures::future::poll_immediate(fixture.tcp.service())
+        let frame = crate::future::poll_immediate(fixture.tcp.service())
             .await
             .ok_or("tcp service did not return a value".to_string())?;
 
@@ -989,7 +989,7 @@ mod test {
         // Intentionally do not inform the mock of the second frame
 
         // After we've sent first two packets, nothing to do
-        test_true!(futures::future::poll_immediate(fixture.tcp.service())
+        test_true!(crate::future::poll_immediate(fixture.tcp.service())
             .await
             .is_none());
 
@@ -1008,7 +1008,7 @@ mod test {
         }
 
         // 3 acks, retransmission please
-        test_true!(futures::future::poll_immediate(fixture.tcp.service())
+        test_true!(crate::future::poll_immediate(fixture.tcp.service())
             .await
             .is_some());
 

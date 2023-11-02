@@ -24,7 +24,7 @@ pub struct WakeupRequester {
 
 impl WakeupRequester {
     pub async fn register_wakeup_time(&self, tick: usize) {
-        let waker = futures::future::poll_fn(|cx| Poll::Ready(cx.waker().clone())).await;
+        let waker = crate::future::poll_fn(|cx| Poll::Ready(cx.waker().clone())).await;
         let mut wakeup_times = self.posted_wakeup_times.lock().await;
         wakeup_times.push_back((tick, waker));
         if let Some(waker) = self.service_waker.get() {
