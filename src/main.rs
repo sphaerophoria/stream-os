@@ -39,7 +39,6 @@ mod sleep;
 mod time;
 mod util;
 
-use crate::future::Either;
 use acpi::MadtEntry;
 use alloc::{
     boxed::Box,
@@ -63,9 +62,15 @@ use hashbrown::HashMap;
 use crate::{
     acpi::AcpiTable,
     framebuffer::FrameBuffer,
-    future::Executor,
+    future::{Either, Executor},
     interrupts::{InitInterruptError, InterruptHandlerData},
-    io::{io_allocator::IoAllocator, pci::Pci, ps2::Ps2Keyboard, rtc::Rtc, serial::Serial},
+    io::{
+        io_allocator::IoAllocator,
+        pci::{Pci, PciDevice},
+        ps2::Ps2Keyboard,
+        rtc::Rtc,
+        serial::Serial,
+    },
     multiprocessing::CpuFnDispatcher,
     net::{
         tcp::Tcp, ArpFrame, ArpFrameParams, ArpOperation, EtherType, EthernetFrameParams,
@@ -241,8 +246,33 @@ impl Kernel {
 
         let mut pci = Pci::new(&mut io_allocator).expect("Failed to initialize pci");
 
-        let rtl8139 = Rtl8139::new(&mut pci, interrupt_handlers, false)
-            .expect("Failed to initialize rtl8139");
+        let pci_devices: Vec<_> = pci
+            .devices()
+            .filter_map(|device| match device {
+                Ok(PciDevice::General(device)) => Some(device),
+                _ => None,
+            })
+            .collect();
+
+        let mut rtl8139 = None;
+        for mut device in pci_devices {
+            let id = device.id(&mut pci);
+            let interface_id = device.interface_id(&mut pci);
+
+            debug!(
+                "PCI device: {:?} with id {:#x}, {:#x} and interface: {:?}",
+                device, id.0, id.1, interface_id
+            );
+
+            if id == Rtl8139::PCI_ID {
+                rtl8139 = Some(
+                    Rtl8139::new(device, &mut pci, interrupt_handlers, false)
+                        .expect("Failed to initialize rtl8139"),
+                );
+            }
+        }
+
+        let rtl8139 = rtl8139.expect("Failed to find pci device id for rtl8139");
 
         let arp_table = ArpTable::new();
         let rng = Mutex::new(Rng::new(rtc.read().unwrap().seconds as u64));

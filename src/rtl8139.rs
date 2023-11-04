@@ -1,6 +1,6 @@
 use crate::{
     interrupts::{InterruptHandlerData, InterruptHandlerRegisterError, IrqId},
-    io::pci::{GeneralPciDevice, InvalidHeaderError, Pci, PciDevice},
+    io::pci::{GeneralPciDevice, Pci},
     util::{
         async_mutex::Mutex,
         atomic_cell::AtomicCell,
@@ -443,9 +443,6 @@ unsafe fn increment_capr(base: *mut u8, receive_buf: &[u8]) {
 
 #[derive(Debug)]
 pub enum Rtl8139InitError {
-    PciProbeFailed(InvalidHeaderError),
-    DeviceNotFound,
-    PciHeaderTypeIncorrect(PciDevice),
     MmapRangeNotFound,
     MmapRangeUnexpected(usize),
     InitReceiveBuffer(InitReceiveBufferError),
@@ -469,25 +466,14 @@ struct Inner {
 
 impl Inner {
     pub fn new(
+        mut device: GeneralPciDevice,
         pci: &mut Pci,
         interrupt_handlers: &InterruptHandlerData,
         with_loopback: bool,
         waker_list: Arc<SpinLock<HashMap<usize, Waker>>>,
         service_waker: Arc<AtomicCell<Waker>>,
     ) -> Result<Inner, Rtl8139InitError> {
-        let device = pci
-            .find_device(0x10ec, 0x8139)
-            .map_err(Rtl8139InitError::PciProbeFailed)?
-            .ok_or(Rtl8139InitError::DeviceNotFound)?;
-
-        let mut rtl_device = match device {
-            PciDevice::General(v) => v,
-            _ => {
-                return Err(Rtl8139InitError::PciHeaderTypeIncorrect(device));
-            }
-        };
-
-        let mmap_range = rtl_device
+        let mmap_range = device
             .find_mmap_range(pci)
             .ok_or(Rtl8139InitError::MmapRangeNotFound)?;
 
@@ -496,7 +482,7 @@ impl Inner {
         }
 
         // Required for the card to write to memory
-        rtl_device.enable_bus_mastering(pci);
+        device.enable_bus_mastering(pci);
 
         unsafe {
             reset_device(mmap_range.start);
@@ -505,7 +491,7 @@ impl Inner {
             init_interrupts(
                 mmap_range.start,
                 pci,
-                &mut rtl_device,
+                &mut device,
                 interrupt_handlers,
                 Arc::clone(&service_waker),
             )
@@ -601,7 +587,10 @@ pub struct Rtl8139 {
 }
 
 impl Rtl8139 {
+    pub const PCI_ID: (u16, u16) = (0x10ec, 0x8139);
+
     pub fn new(
+        device: GeneralPciDevice,
         pci: &mut Pci,
         interrupt_handlers: &InterruptHandlerData,
         with_loopback: bool,
@@ -610,12 +599,14 @@ impl Rtl8139 {
         let waker_list = Arc::new(SpinLock::new(HashMap::new()));
 
         let inner = Mutex::new(Inner::new(
+            device,
             pci,
             interrupt_handlers,
             with_loopback,
             Arc::clone(&waker_list),
             Arc::clone(&service_waker),
         )?);
+
         Ok(Rtl8139 {
             inner,
             waker_list,
