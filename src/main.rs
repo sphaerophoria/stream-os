@@ -37,6 +37,7 @@ mod rng;
 mod rtl8139;
 mod sleep;
 mod time;
+mod uhci;
 mod util;
 
 use acpi::MadtEntry;
@@ -80,6 +81,7 @@ use crate::{
     rtl8139::Rtl8139,
     sleep::{WakeupRequester, WakeupService},
     time::MonotonicTime,
+    uhci::Uhci,
     util::async_mutex::Mutex,
     util::interrupt_guard::InterruptGuarded,
 };
@@ -201,6 +203,7 @@ struct Kernel {
     pci: Pci,
     ps2: Ps2Keyboard,
     rtl8139: Rtl8139,
+    uhci: Uhci,
     arp_table: ArpTable,
     serial: Arc<Serial>,
     framebuffer: FrameBuffer,
@@ -255,6 +258,8 @@ impl Kernel {
             .collect();
 
         let mut rtl8139 = None;
+        let mut uhci = None;
+
         for mut device in pci_devices {
             let id = device.id(&mut pci);
             let interface_id = device.interface_id(&mut pci);
@@ -269,10 +274,22 @@ impl Kernel {
                     Rtl8139::new(device, &mut pci, interrupt_handlers, false)
                         .expect("Failed to initialize rtl8139"),
                 );
+            } else if interface_id.class == 0x0c
+                && interface_id.subclass == 0x03
+                && interface_id.interface == 0x00
+            {
+                uhci = Some(Uhci::new(
+                    device,
+                    &mut io_allocator,
+                    &mut pci,
+                    Arc::clone(&monotonic_time),
+                    wakeup_requester.clone(),
+                ));
             }
         }
 
         let rtl8139 = rtl8139.expect("Failed to find pci device id for rtl8139");
+        let uhci = uhci.expect("Failed to find uhci controller");
 
         let arp_table = ArpTable::new();
         let rng = Mutex::new(Rng::new(rtc.read().unwrap().seconds as u64));
@@ -324,6 +341,7 @@ impl Kernel {
             ps2,
             arp_table,
             rtl8139,
+            uhci,
             serial,
             tcp,
             framebuffer,
@@ -473,6 +491,7 @@ impl Kernel {
         executor.spawn(self.wakeup_service.service());
         executor.spawn(self.rtl8139.service());
         executor.spawn(self.cpu_dispatcher.service());
+        executor.spawn(self.uhci.demo());
         executor.run();
 
         info!("And now we exit/halt");

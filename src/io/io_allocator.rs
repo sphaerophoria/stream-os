@@ -102,6 +102,33 @@ impl IoRange {
         }
     }
 
+    pub fn write_16(&mut self, offset: IoOffset, val: u16) -> Result<(), OffsetOutOfRange> {
+        self.verify_offset(offset, 2)?;
+        unsafe {
+            asm!(r#"
+                out %ax, %dx
+                "#,
+                in("dx") self.addr + offset.0,
+                in("ax") val,
+                options(att_syntax));
+        }
+        Ok(())
+    }
+
+    pub fn read_16(&mut self, offset: IoOffset) -> Result<u16, OffsetOutOfRange> {
+        self.verify_offset(offset, 2)?;
+        unsafe {
+            let mut ret;
+            asm!(r#"
+                in %dx, %ax
+                "#,
+                in("dx") self.addr + offset.0,
+                out("ax") ret,
+                options(att_syntax));
+            Ok(ret)
+        }
+    }
+
     pub fn write_32(&mut self, offset: IoOffset, val: u32) -> Result<(), OffsetOutOfRange> {
         self.verify_offset(offset, 4)?;
         unsafe {

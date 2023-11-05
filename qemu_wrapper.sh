@@ -31,6 +31,6 @@ cp "$KERNEL" isodir/boot/myos.bin
 cp grub.cfg isodir/boot/grub/grub.cfg
 grub-mkrescue -o myos.iso isodir 2> /dev/null
 
-qemu-system-i386 $GDB_CMD $STDIO_CMD $DUMP_NET_CMD -netdev tap,id=n0,ifname=$TAP_IF,script=no,downscript=no -device rtl8139,netdev=n0,bus=pci.0,addr=4,mac=12:34:56:78:9a:bc -device isa-debug-exit,iobase=0xf4,iosize=0x01 -cdrom myos.iso -smp $NUM_CORES -enable-kvm -cpu host
+qemu-system-i386 $GDB_CMD $STDIO_CMD $DUMP_NET_CMD -netdev tap,id=n0,ifname=$TAP_IF,script=no,downscript=no -device rtl8139,netdev=n0,bus=pci.0,addr=4,mac=12:34:56:78:9a:bc -device isa-debug-exit,iobase=0xf4,iosize=0x01 -cdrom myos.iso -smp $NUM_CORES -enable-kvm -cpu host -usb -device usb-ehci,id=ehci -device usb-tablet,bus=usb-bus.0,port=2
 
 exit $(($? >> 1))
