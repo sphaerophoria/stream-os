@@ -16,8 +16,10 @@ There is no real goal, other than understanding computers better. We will implem
 - ARP
 - UDP
 - TCP (kinda)
+- HTTP
 - Graphics
 - Keyboard
+- Multicore
 
 ## Usage
 
