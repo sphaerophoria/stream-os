@@ -13,6 +13,7 @@ use core::{
 use alloc::{
     collections::{BTreeMap, VecDeque},
     sync::Arc,
+    vec::Vec,
 };
 
 // Multi-thread way to request wakeups
@@ -61,7 +62,7 @@ impl core::future::Future for TimeWaiter<'_> {
 // Registers wakeup requests with interrupt handler
 pub struct WakeupService {
     posted_wakeup_times: Arc<Mutex<VecDeque<(usize, Waker)>>>,
-    interrupt_visible_wakeup_times: Arc<InterruptGuarded<BTreeMap<usize, Waker>>>,
+    interrupt_visible_wakeup_times: Arc<InterruptGuarded<BTreeMap<usize, Vec<Waker>>>>,
     service_waker: Arc<AtomicCell<Waker>>,
 }
 
@@ -77,7 +78,8 @@ impl WakeupService {
             let mut interrupt_times = self.interrupt_visible_wakeup_times.lock();
             let len = wakeup_times.len();
             for (time, waker) in wakeup_times.drain(..len) {
-                interrupt_times.insert(time, waker);
+                let val = interrupt_times.entry(time).or_default();
+                val.push(waker);
             }
         }
     }
@@ -85,7 +87,7 @@ impl WakeupService {
 
 // Checks wakeups in interrupt handler
 pub struct InterruptWakeupList {
-    wakeup_times: Arc<InterruptGuarded<BTreeMap<usize, Waker>>>,
+    wakeup_times: Arc<InterruptGuarded<BTreeMap<usize, Vec<Waker>>>>,
 }
 
 impl InterruptWakeupList {
@@ -101,8 +103,10 @@ impl InterruptWakeupList {
         }
 
         for _ in 0..last_idx {
-            let (_, waker) = wakeup_times.pop_first().expect("Expected a time");
-            waker.wake_by_ref();
+            let (_, wakers) = wakeup_times.pop_first().expect("Expected a time");
+            for waker in wakers {
+                waker.wake_by_ref();
+            }
         }
     }
 }
