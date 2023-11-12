@@ -1,8 +1,11 @@
 use crate::{
+    cursor::Pos as CursorPos,
     framebuffer::FrameBuffer,
+    future::Either,
     io::ps2::Ps2Keyboard,
     sleep::{self, WakeupRequester},
     time::MonotonicTime,
+    util::updated_val::UpdatedVal,
 };
 
 use core::ops::{Add, AddAssign};
@@ -88,6 +91,7 @@ pub struct Game<'a> {
     ps2: &'a mut Ps2Keyboard,
     monotonic_time: &'a MonotonicTime,
     wakeup_list: &'a WakeupRequester,
+    cursor_pos: UpdatedVal<CursorPos>,
 }
 
 impl<'a> Game<'a> {
@@ -96,6 +100,7 @@ impl<'a> Game<'a> {
         ps2: &'a mut Ps2Keyboard,
         monotonic_time: &'a MonotonicTime,
         wakeup_list: &'a WakeupRequester,
+        cursor_pos: UpdatedVal<CursorPos>,
     ) -> Game<'a> {
         let state = State {
             pause: false,
@@ -112,6 +117,7 @@ impl<'a> Game<'a> {
             monotonic_time,
             wakeup_list,
             state,
+            cursor_pos,
         }
     }
 
@@ -124,31 +130,33 @@ impl<'a> Game<'a> {
         draw_rect(&paddle_box, &[1.0, 1.0, 1.0], self.framebuffer)
     }
 
-    async fn handle_input(&mut self) {
-        let key = crate::future::poll_immediate(self.ps2.read()).await;
-
-        match key {
-            Some(D_DOWN) => {
+    fn handle_input(&mut self, input: Option<Input>) {
+        match input {
+            Some(Input::Keyboard(D_DOWN)) => {
                 self.state.paddle_dir = 1;
             }
-            Some(D_UP) => {
+            Some(Input::Keyboard(D_UP)) => {
                 if self.state.paddle_dir == 1 {
                     self.state.paddle_dir = 0;
                 }
             }
-            Some(A_DOWN) => {
+            Some(Input::Keyboard(A_DOWN)) => {
                 self.state.paddle_dir = -1;
             }
-            Some(A_UP) => {
+            Some(Input::Keyboard(A_UP)) => {
                 if self.state.paddle_dir == -1 {
                     self.state.paddle_dir = 0;
                 }
             }
-            _ => (),
-        }
+            Some(Input::Keyboard(185)) => {
+                self.state.pause = !self.state.pause;
+            }
 
-        if let Some(185) = key {
-            self.state.pause = !self.state.pause;
+            Some(Input::Mouse(pos)) => {
+                self.state.paddle_position = pos.x;
+                self.state.paddle_dir = 0;
+            }
+            _ => (),
         }
     }
 
@@ -184,8 +192,10 @@ impl<'a> Game<'a> {
         draw_bricks(&self.state.bricks, self.framebuffer);
     }
 
-    async fn update(&mut self) {
-        self.handle_input().await;
+    fn update(&mut self, input: Option<Input>) {
+        // When input happens, update game state
+        // Otherwise, update game state and sleep
+        self.handle_input(input);
 
         if self.state.pause {
             return;
@@ -196,15 +206,34 @@ impl<'a> Game<'a> {
     }
 
     pub async fn run(&mut self) {
+        let mut input = None;
         loop {
             let start = self.monotonic_time.get();
-            self.update().await;
-            let end = self.monotonic_time.get();
+            // Input handling goes here
+            self.update(core::mem::take(&mut input));
 
-            let elapsed_s = (end - start) as f32 / self.monotonic_time.tick_freq();
-            if elapsed_s < DELTA {
-                let remaining_s = DELTA - elapsed_s;
-                sleep::sleep(remaining_s, self.monotonic_time, self.wakeup_list).await;
+            let next_frame_time = start + (DELTA * self.monotonic_time.tick_freq()) as usize;
+
+            let now = self.monotonic_time.get();
+            let remaining_s = (next_frame_time - now) as f32 / self.monotonic_time.tick_freq();
+            let mut sleep_fut = core::pin::pin!(sleep::sleep(
+                remaining_s,
+                self.monotonic_time,
+                self.wakeup_list
+            ));
+
+            loop {
+                let input_fut = core::pin::pin!(wait_for_input(self.ps2, &self.cursor_pos));
+
+                match crate::future::select(input_fut, sleep_fut).await {
+                    Either::Left((found_input, next_sleep_fut)) => {
+                        input = Some(found_input);
+                        sleep_fut = next_sleep_fut;
+                    }
+                    Either::Right((_, _)) => {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -366,5 +395,22 @@ fn draw_rect(rect: &Rect, color: &[f32; 3], framebuffer: &mut FrameBuffer) {
         for x in min_x..max_x {
             framebuffer.set_pixel(y, x, fb_color);
         }
+    }
+}
+
+enum Input {
+    Keyboard(u8),
+    Mouse(CursorPos),
+}
+
+async fn wait_for_input(ps2: &mut Ps2Keyboard, mouse: &UpdatedVal<CursorPos>) -> Input {
+    let fut1 = core::pin::pin!(ps2.read());
+    let fut2 = core::pin::pin!(mouse.wait());
+
+    let input = crate::future::select(fut1, fut2).await;
+
+    match input {
+        Either::Left((keyboard_input, _)) => Input::Keyboard(keyboard_input),
+        Either::Right((mouse_input, _)) => Input::Mouse(mouse_input),
     }
 }

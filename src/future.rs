@@ -253,6 +253,7 @@ where
     }
 }
 
+#[allow(unused)]
 pub fn poll_immediate<R, F: Future<Output = R>>(f: F) -> impl Future<Output = Option<R>> {
     PollImmediate { f: Some(f) }
 }

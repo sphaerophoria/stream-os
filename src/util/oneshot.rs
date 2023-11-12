@@ -1,10 +1,11 @@
 use crate::util::async_mutex::Mutex;
 
-use alloc::{collections::VecDeque, sync::Arc};
+use alloc::sync::Arc;
 use core::task::{Poll, Waker};
 
 struct Inner<T> {
-    queue: VecDeque<T>,
+    val: Option<T>,
+    is_set: bool,
     waker: Option<Waker>,
 }
 
@@ -12,18 +13,15 @@ pub struct Sender<T> {
     inner: Arc<Mutex<Inner<T>>>,
 }
 
-impl<T> Clone for Sender<T> {
-    fn clone(&self) -> Self {
-        let inner = Arc::clone(&self.inner);
-
-        Self { inner }
-    }
-}
-
 impl<T> Sender<T> {
-    pub async fn send(&self, val: T) {
+    pub async fn send(self, val: T) {
         let mut inner = self.inner.lock().await;
-        inner.queue.push_back(val);
+
+        assert!(inner.val.is_none());
+
+        inner.val = Some(val);
+        inner.is_set = true;
+
         if let Some(waker) = &inner.waker {
             waker.wake_by_ref();
         }
@@ -35,7 +33,7 @@ struct ReceiverWaiter<'a, T> {
 }
 
 impl<T> core::future::Future for ReceiverWaiter<'_, T> {
-    type Output = T;
+    type Output = Result<T, AlreadyReceived>;
 
     fn poll(
         self: core::pin::Pin<&mut Self>,
@@ -49,26 +47,35 @@ impl<T> core::future::Future for ReceiverWaiter<'_, T> {
 
         guard.waker = Some(cx.waker().clone());
 
-        match guard.queue.pop_front() {
-            Some(v) => Poll::Ready(v),
-            None => Poll::Pending,
+        if guard.is_set && guard.val.is_none() {
+            return Poll::Ready(Err(AlreadyReceived));
         }
+
+        if let Some(v) = core::mem::take(&mut guard.val) {
+            return Poll::Ready(Ok(v));
+        }
+
+        Poll::Pending
     }
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AlreadyReceived;
 
 pub struct Receiver<T> {
     inner: Arc<Mutex<Inner<T>>>,
 }
 
 impl<T> Receiver<T> {
-    pub async fn recv(&self) -> T {
+    pub async fn recv(&self) -> Result<T, AlreadyReceived> {
         ReceiverWaiter { inner: &self.inner }.await
     }
 }
 
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let inner = Inner {
-        queue: VecDeque::new(),
+        val: None,
+        is_set: false,
         waker: None,
     };
     let inner = Arc::new(Mutex::new(inner));
@@ -83,22 +90,21 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
 mod test {
     use super::*;
     use crate::testing::*;
-    use core::future::Future;
 
-    create_test!(test_async_channel, {
+    create_test!(test_submission, {
         let (tx, rx) = channel();
-        tx.send(1).await;
-        test_eq!(rx.recv().await, 1);
 
-        let recv_poll = crate::future::poll_fn(|cx| {
-            let val = core::pin::pin!(rx.recv()).poll(cx);
-            Poll::Ready(val)
-        })
-        .await;
+        let val = crate::future::poll_immediate(rx.recv()).await;
+        test_true!(val.is_none());
 
-        if recv_poll.is_ready() {
-            return Err("async receiver had data when it shouldn't".into());
-        }
+        tx.send(4).await;
+
+        let val = crate::future::poll_immediate(rx.recv()).await;
+        test_eq!(val, Some(Ok::<_, AlreadyReceived>(4)));
+
+        let val = crate::future::poll_immediate(rx.recv()).await;
+        test_eq!(val, Some(Err::<i32, _>(AlreadyReceived)));
+
         Ok(())
     });
 }

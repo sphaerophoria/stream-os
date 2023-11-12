@@ -8,9 +8,10 @@ use crate::{
     util::bit_manipulation::{GetBits, SetBits},
 };
 
-use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec, vec::Vec};
+use super::{Pid, UsbPacket};
+
+use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
 use core::{
-    fmt,
     future::Future,
     task::{Context, Poll},
 };
@@ -19,100 +20,6 @@ const USB_CMD_OFFSET: IoOffset = IoOffset::new(0);
 const USB_STATUS_OFFSET: IoOffset = IoOffset::new(0x02);
 const FRAME_NUMBER_OFFSET: IoOffset = IoOffset::new(0x06);
 const FRAME_LIST_OFFSET: IoOffset = IoOffset::new(0x08);
-
-struct UsbDeviceDescriptor<'a>(&'a [u8]);
-
-impl UsbDeviceDescriptor<'_> {
-    fn length(&self) -> u8 {
-        self.0[0]
-    }
-    fn descriptor_type(&self) -> u8 {
-        self.0[1]
-    }
-    fn bcd_usb_version(&self) -> u16 {
-        u16::from_le_bytes(
-            self.0[2..2 + 2]
-                .try_into()
-                .expect("Failed to convert to 2 byte array"),
-        )
-    }
-    fn device_class(&self) -> u8 {
-        self.0[4]
-    }
-    fn device_sublcass(&self) -> u8 {
-        self.0[5]
-    }
-    fn device_protocol(&self) -> u8 {
-        self.0[6]
-    }
-    fn max_packet_size_endpoint_zero(&self) -> u8 {
-        self.0[7]
-    }
-    fn vendor_id(&self) -> u16 {
-        u16::from_le_bytes(
-            self.0[8..8 + 2]
-                .try_into()
-                .expect("Failed to convert to 2 byte array"),
-        )
-    }
-    fn product_id(&self) -> u16 {
-        u16::from_le_bytes(
-            self.0[10..10 + 2]
-                .try_into()
-                .expect("Failed to convert to 2 byte array"),
-        )
-    }
-    fn device_version(&self) -> u16 {
-        u16::from_le_bytes(
-            self.0[12..12 + 2]
-                .try_into()
-                .expect("Failed to convert to 2 byte array"),
-        )
-    }
-    fn manufacturer_string_id(&self) -> u8 {
-        self.0[14]
-    }
-    fn product_string_id(&self) -> u8 {
-        self.0[15]
-    }
-    fn serial_number_id(&self) -> u8 {
-        self.0[16]
-    }
-
-    fn num_configurations(&self) -> u8 {
-        self.0[17]
-    }
-}
-
-impl fmt::Debug for UsbDeviceDescriptor<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "UsbDeviceDescriptor {{")?;
-        write!(f, "length: {:#x}, ", self.length())?;
-        write!(f, "descriptor_type: {:#x}, ", self.descriptor_type())?;
-        write!(f, "bcd_usb_version: {:#x}, ", self.bcd_usb_version())?;
-        write!(f, "device_class: {:#x}, ", self.device_class())?;
-        write!(f, "device_sublcass: {:#x}, ", self.device_sublcass())?;
-        write!(f, "device_protocol: {:#x}, ", self.device_protocol())?;
-        write!(
-            f,
-            "max_packet_size_endpoint_zero: {:#x}, ",
-            self.max_packet_size_endpoint_zero()
-        )?;
-        write!(f, "vendor_id: {:#x}, ", self.vendor_id())?;
-        write!(f, "product_id: {:#x}, ", self.product_id())?;
-        write!(f, "device_version: {:#x}, ", self.device_version())?;
-        write!(
-            f,
-            "manufacturer_string_id: {:#x}, ",
-            self.manufacturer_string_id()
-        )?;
-        write!(f, "product_string_id: {:#x}, ", self.product_string_id())?;
-        write!(f, "serial_number_id: {:#x}, ", self.serial_number_id())?;
-        write!(f, "num_configurations: {:#x}, ", self.num_configurations())?;
-        write!(f, "}}")?;
-        Ok(())
-    }
-}
 
 struct UsbCmdReg {
     max_packet: bool,
@@ -243,15 +150,15 @@ impl UsbPortStatus {
     }
 }
 
-struct UsbFuture<'a> {
+pub struct UhciFuture<'a> {
     buffers: &'a mut BTreeMap<u64, Box<TransferDescriptorStorage>>,
     time: Arc<MonotonicTime>,
     wakeup_requester: WakeupRequester,
     ids: Vec<u64>,
 }
 
-impl Future for UsbFuture<'_> {
-    type Output = Vec<Box<TransferDescriptorStorage>>;
+impl Future for UhciFuture<'_> {
+    type Output = Vec<Vec<u8>>;
 
     fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         for id in &self.ids {
@@ -277,7 +184,7 @@ impl Future for UsbFuture<'_> {
         for id in self.ids.clone() {
             let mut buf = self.buffers.remove(&id).expect("Failed to remove id");
             buf.hw_sync();
-            ret.push(buf);
+            ret.push(buf.buf);
         }
 
         Poll::Ready(ret)
@@ -289,12 +196,6 @@ pub struct InvalidPacketErr;
 
 #[derive(Debug, Hash)]
 struct TransferDescriptorID(usize);
-
-enum Pid {
-    Setup,
-    In,
-    Out,
-}
 
 pub struct Uhci {
     frame_list: Vec<u32>,
@@ -359,8 +260,11 @@ impl Uhci {
     // NOTE: Vec<Box> looks odd, however we need to ensure that TransferDescriptorStorage does not
     // move in memory
     #[allow(clippy::vec_box)]
-    fn append_work(&mut self, mut work: Vec<Box<TransferDescriptorStorage>>) -> UsbFuture<'_> {
-        // FIXME: return future of work to be done
+    pub fn append_work(&mut self, work: Vec<UsbPacket>) -> UhciFuture<'_> {
+        let mut work: Vec<_> = work
+            .into_iter()
+            .map(|item| generate_td(item).expect("Invalid packet"))
+            .collect();
         chain_tds(&mut work);
 
         // FIXME: Stop the card from running while we push
@@ -388,7 +292,7 @@ impl Uhci {
 
         self.master_queue.bufs.extend(iter);
 
-        UsbFuture {
+        UhciFuture {
             buffers: &mut self.master_queue.bufs,
             time: Arc::clone(&self.time),
             wakeup_requester: self.wakeup_requester.clone(),
@@ -396,7 +300,7 @@ impl Uhci {
         }
     }
 
-    pub async fn reset(&mut self) {
+    async fn reset(&mut self) {
         let reset_cmd = UsbCmdReg {
             max_packet: false,
             configure: false,
@@ -432,8 +336,8 @@ impl Uhci {
         self.io_range
             .write_16(USB_CMD_OFFSET, unreset_cmd)
             .expect("Invalid offset for usb cmd");
-        // FIXME: sleep 50ms doesn't seem to work
-        crate::sleep::sleep(0.06, &self.time, &self.wakeup_requester).await;
+
+        crate::sleep::sleep(0.05, &self.time, &self.wakeup_requester).await;
 
         let hostreset_cmd = UsbCmdReg {
             max_packet: false,
@@ -454,7 +358,7 @@ impl Uhci {
         crate::sleep::sleep(0.01, &self.time, &self.wakeup_requester).await;
     }
 
-    pub fn set_frame_list_offset(&mut self) {
+    fn set_frame_list_offset(&mut self) {
         debug!(
             "Writing frame list offset as {:?}",
             self.frame_list.as_ptr()
@@ -464,19 +368,19 @@ impl Uhci {
             .expect("Failed to write frame list offset");
     }
 
-    pub fn set_frame_number(&mut self, val: u16) {
+    fn set_frame_number(&mut self, val: u16) {
         self.io_range
             .write_16(FRAME_NUMBER_OFFSET, val)
             .expect("Failed to write frame number offset");
     }
 
-    pub fn clear_usb_status(&mut self) {
+    fn clear_usb_status(&mut self) {
         self.io_range
             .write_16(USB_STATUS_OFFSET, 0x1f)
             .expect("Failed to clear status register");
     }
 
-    pub fn enable_uhci_card(&mut self) {
+    fn enable_uhci_card(&mut self) {
         let cmd = UsbCmdReg {
             max_packet: true,
             configure: true,
@@ -552,107 +456,12 @@ impl Uhci {
         val.port_enabled() && val.connected()
     }
 
-    pub async fn get_descriptor(&mut self, address: u8) -> Vec<u8> {
-        // https://github.com/fysnet/FYSOS/blob/9fea9ca93a2600afdac3060e8c45b4678998abe8/main/usb/utils/gdevdesc/gd_uhci.c#L320C3-L320C85
-        let setup_packet = vec![0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00];
-        let setup_td =
-            generate_td(address, 0, Pid::Setup, setup_packet).expect("Invalid setup packet");
-        let read_td = generate_td(address, 0, Pid::In, vec![0; 18]).expect("Invalid read packet");
-        let mut ack_td = generate_td(address, 0, Pid::Out, vec![]).expect("Invalid ack packet");
-        // FIXME: Automatically handle data toggle
-        ack_td.descriptor.set_data_toggle(true);
-
-        let work = vec![setup_td, read_td, ack_td];
-        let mut work = self.append_work(work).await;
-
-        debug!("Read descriptor: {:?}", UsbDeviceDescriptor(&work[1].buf));
-        work.remove(1).buf
-    }
-
-    pub async fn set_address(&mut self, address: u8) {
-        let address_setup_packet = vec![0x00, 0x05, address, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let setup_td =
-            generate_td(0, 0, Pid::Setup, address_setup_packet).expect("Invalid setup packet");
-        let mut ack_td = generate_td(0, 0, Pid::In, vec![]).expect("Invalid ack packet");
-        ack_td.descriptor.set_data_toggle(true);
-
-        let work = vec![setup_td, ack_td];
-        let _ = self.append_work(work).await;
-    }
-
-    pub async fn print_configurations(&mut self, address: u8) {
-        let descriptor = self.get_descriptor(address).await;
-
-        for i in 0..UsbDeviceDescriptor(&descriptor).num_configurations() {
-            debug!("Getting configuration {i}");
-
-            let setup_packet = vec![0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x80, 0x00];
-            let setup_td =
-                generate_td(1, 0, Pid::Setup, setup_packet).expect("Invalid setup packet");
-            let read_td =
-                generate_td(address, 0, Pid::In, vec![0; 0x80]).expect("Invalid read packet");
-            let mut ack_td = generate_td(address, 0, Pid::Out, vec![]).expect("Invalid ack packet");
-            // FIXME: Automatically handle data toggle
-            ack_td.descriptor.set_data_toggle(true);
-
-            let work = vec![setup_td, read_td, ack_td];
-            let work = self.append_work(work).await;
-
-            debug!("Got configuration response: {:?}", work[1].buf);
-        }
-    }
-
-    pub async fn set_configuration(&mut self, address: u8, config: u8) {
-        // Set configuration
-        let setup_packet = vec![0x00, 0x09, config, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let setup_td =
-            generate_td(address, 0, Pid::Setup, setup_packet).expect("Invalid setup packet");
-        let mut ack_td = generate_td(address, 0, Pid::In, vec![]).expect("Invalid ack packet");
-        ack_td.descriptor.set_data_toggle(true);
-        let work = vec![setup_td, ack_td];
-        let _ = self.append_work(work).await;
-    }
-
-    pub async fn demo(&mut self) {
+    pub async fn init(&mut self) {
         self.reset().await;
         self.set_frame_list_offset();
         self.set_frame_number(0);
         self.clear_usb_status();
         self.enable_uhci_card();
-
-        for port_offset in [IoOffset::new(0x10), IoOffset::new(0x12)] {
-            let enabled = self.reset_port(port_offset).await;
-            debug!("Port {:?}: {enabled}", port_offset);
-            if !enabled {
-                continue;
-            }
-
-            //let descriptor = self.get_descriptor(0).await;
-            const ADDRESS: u8 = 1;
-            self.set_address(ADDRESS).await;
-            self.print_configurations(ADDRESS).await;
-            self.set_configuration(ADDRESS, 1).await;
-
-            // Get report
-            let mut mouse_pos = Vec::new();
-            loop {
-                let setup_packet = vec![0xa1, 0x01, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00];
-                let setup_td =
-                    generate_td(1, 0, Pid::Setup, setup_packet).expect("Invalid setup packet");
-                let read_td = generate_td(1, 0, Pid::In, vec![1; 8]).expect("Invalid read packet");
-                let mut ack_td = generate_td(1, 0, Pid::Out, vec![]).expect("Invalid ack packet");
-                ack_td.descriptor.set_data_toggle(true);
-                let work = vec![setup_td, read_td, ack_td];
-                let mut work = self.append_work(work).await;
-                let new_mouse_pos = &mut work[1].buf;
-                if *new_mouse_pos != mouse_pos {
-                    info!("Mouse moved: {:?}", new_mouse_pos);
-                    mouse_pos = new_mouse_pos.clone();
-                }
-
-                crate::sleep::sleep(0.1, &self.time, &self.wakeup_requester).await;
-            }
-        }
     }
 }
 
@@ -716,7 +525,6 @@ struct TransferDescriptor([u32; 8]);
 
 #[allow(unused)]
 impl TransferDescriptor {
-    // FIXME: Maybe should return an enum or something?
     fn link_pointer(&self) -> LinkPointer {
         get_link_pointer(self.0[0])
     }
@@ -900,19 +708,14 @@ fn chain_tds(tds: &mut [Box<TransferDescriptorStorage>]) {
     }
 }
 
-fn generate_td(
-    address: u8,
-    endpoint: u8,
-    pid: Pid,
-    buf: Vec<u8>,
-) -> Result<Box<TransferDescriptorStorage>, InvalidPacketErr> {
+fn generate_td(packet: UsbPacket) -> Result<Box<TransferDescriptorStorage>, InvalidPacketErr> {
     const USB_MAX_PACKET_LEN: usize = 1024;
-    if buf.len() > USB_MAX_PACKET_LEN {
+    if packet.data.len() > USB_MAX_PACKET_LEN {
         return Err(InvalidPacketErr);
     }
 
     let mut ret = Box::new(TransferDescriptorStorage {
-        buf,
+        buf: packet.data,
         descriptor: TransferDescriptor([0; 8]),
     });
     ret.descriptor.set_link_pointer(&LinkPointer::None);
@@ -920,15 +723,16 @@ fn generate_td(
     ret.descriptor.set_status(0x80);
     ret.descriptor
         .set_maxlen(ret.buf.len().try_into().map_err(|_| InvalidPacketErr)?);
-    ret.descriptor.set_address(address);
-    ret.descriptor.set_endpoint(endpoint);
-    let pid = match pid {
+    ret.descriptor.set_address(packet.address);
+    ret.descriptor.set_endpoint(packet.endpoint);
+    let pid = match packet.pid {
         Pid::Setup => 0b0010_1101,
         Pid::Out => 0b1110_0001,
         Pid::In => 0b0110_1001,
     };
     ret.descriptor.set_pid(pid);
     ret.descriptor.set_data(ret.buf.as_mut_ptr());
+    ret.descriptor.set_data_toggle(packet.data_toggle);
 
     Ok(ret)
 }

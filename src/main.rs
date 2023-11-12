@@ -27,9 +27,11 @@ mod gdt;
 #[macro_use]
 mod interrupts;
 mod acpi;
+mod cursor;
 mod framebuffer;
 mod io;
 mod libc;
+mod mouse;
 mod multiboot2;
 mod multiprocessing;
 mod net;
@@ -37,7 +39,7 @@ mod rng;
 mod rtl8139;
 mod sleep;
 mod time;
-mod uhci;
+mod usb;
 mod util;
 
 use acpi::MadtEntry;
@@ -62,6 +64,7 @@ use hashbrown::HashMap;
 
 use crate::{
     acpi::AcpiTable,
+    cursor::Cursor,
     framebuffer::FrameBuffer,
     future::{Either, Executor},
     interrupts::{InitInterruptError, InterruptHandlerData},
@@ -72,6 +75,7 @@ use crate::{
         rtc::Rtc,
         serial::Serial,
     },
+    mouse::Mouse,
     multiprocessing::CpuFnDispatcher,
     net::{
         tcp::Tcp, ArpFrame, ArpFrameParams, ArpOperation, EtherType, EthernetFrameParams,
@@ -81,7 +85,7 @@ use crate::{
     rtl8139::Rtl8139,
     sleep::{WakeupRequester, WakeupService},
     time::MonotonicTime,
-    uhci::Uhci,
+    usb::{uhci::Uhci, Usb, UsbDescriptor},
     util::async_mutex::Mutex,
     util::interrupt_guard::InterruptGuarded,
 };
@@ -203,10 +207,11 @@ struct Kernel {
     pci: Pci,
     ps2: Ps2Keyboard,
     rtl8139: Rtl8139,
-    uhci: Uhci,
+    usb: Usb,
     arp_table: ArpTable,
     serial: Arc<Serial>,
     framebuffer: FrameBuffer,
+    cursor: Cursor,
     tcp: Tcp,
     monotonic_time: Arc<MonotonicTime>,
     wakeup_requester: WakeupRequester,
@@ -291,6 +296,8 @@ impl Kernel {
         let rtl8139 = rtl8139.expect("Failed to find pci device id for rtl8139");
         let uhci = uhci.expect("Failed to find uhci controller");
 
+        let usb = Usb::new(uhci);
+
         let arp_table = ArpTable::new();
         let rng = Mutex::new(Rng::new(rtc.read().unwrap().seconds as u64));
         let tcp = Tcp::new(Arc::clone(&monotonic_time), wakeup_requester.clone());
@@ -331,6 +338,7 @@ impl Kernel {
         let cpu_dispatcher =
             CpuFnDispatcher::new(apic).expect("Cpu dispatcher construction failed");
 
+        let cursor = Cursor::new();
         Ok(Kernel {
             cpu_dispatcher,
             interrupt_handlers,
@@ -341,7 +349,8 @@ impl Kernel {
             ps2,
             arp_table,
             rtl8139,
-            uhci,
+            cursor,
+            usb,
             serial,
             tcp,
             framebuffer,
@@ -473,12 +482,40 @@ impl Kernel {
             recv_loop(&self.rtl8139, &self.arp_table, &self.tcp, &self.rng).await;
         };
 
+        let mouse_move_tx = self.cursor.get_movement_writer();
         let mut game = game::Game::new(
             &mut self.framebuffer,
             &mut self.ps2,
             &self.monotonic_time,
             &self.wakeup_requester,
+            self.cursor.get_pos_reader(),
         );
+
+        let device_rx = self.usb.device_channel();
+        let usb_handle = self.usb.handle();
+        let usb_driver_dispatch = async {
+            loop {
+                let device = device_rx.recv().await;
+                let descriptors = usb_handle
+                    .get_configuration_descriptors(device.address)
+                    .await;
+                for descriptor in &descriptors {
+                    if let UsbDescriptor::Interface(intf) = descriptor {
+                        if intf.interface_class() == 3
+                            && intf.interface_subclass() == 1
+                            && intf.interface_protocol() == 2
+                        {
+                            info!("Found HID mouse with boot protocol support");
+                            // Check if device is a mouse??
+                            let mut mouse =
+                                Mouse::new(device, usb_handle.clone(), mouse_move_tx.clone());
+                            mouse.service().await;
+                            break;
+                        }
+                    }
+                }
+            }
+        };
 
         let mut executor = Executor::new(Some(&self.cpu_dispatcher));
         executor.spawn(logger::service());
@@ -491,7 +528,9 @@ impl Kernel {
         executor.spawn(self.wakeup_service.service());
         executor.spawn(self.rtl8139.service());
         executor.spawn(self.cpu_dispatcher.service());
-        executor.spawn(self.uhci.demo());
+        executor.spawn(self.usb.service());
+        executor.spawn(usb_driver_dispatch);
+        executor.spawn(self.cursor.service());
         executor.run();
 
         info!("And now we exit/halt");
