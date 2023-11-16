@@ -1,6 +1,6 @@
 use crate::{
-    interrupts::{InterruptHandlerData, InterruptHandlerRegisterError, IrqId},
-    io::pci::{GeneralPciDevice, Pci},
+    interrupts::{InterruptHandlerData, InterruptHandlerRegisterError},
+    io::pci::{GeneralPciDevice, InvalidIrq, Pci},
     util::{
         async_mutex::Mutex,
         atomic_cell::AtomicCell,
@@ -123,23 +123,6 @@ unsafe fn set_interrupt_mask(base: *mut u8) {
     interrupt_mask_reg.write_volatile(0x5);
 }
 
-#[derive(Debug)]
-pub struct InvalidIrq;
-
-unsafe fn get_irq_id(
-    pci: &mut Pci,
-    rtl_device: &mut GeneralPciDevice,
-) -> Result<IrqId, InvalidIrq> {
-    let irq_num = rtl_device.get_irq_num(pci);
-    if irq_num < 8 {
-        Ok(IrqId::Pic1(irq_num))
-    } else if irq_num < 16 {
-        Ok(IrqId::Pic2(irq_num - 8))
-    } else {
-        Err(InvalidIrq)
-    }
-}
-
 unsafe fn clear_interrupt(base: *mut u8) {
     let reg = base.add(INTERRUPT_STATUS_OFFSET) as *mut u16;
     // According to the OSDev wiki, we need to both read _and_ write the register to clear the
@@ -161,7 +144,9 @@ unsafe fn init_interrupts(
     interrupt_handlers: &InterruptHandlerData,
     service_waker: Arc<AtomicCell<Waker>>,
 ) -> Result<(), InitInterruptError> {
-    let irq_id = get_irq_id(pci, rtl_device).map_err(InitInterruptError::InvalidIrq)?;
+    let irq_id = rtl_device
+        .get_irq_num(pci)
+        .map_err(InitInterruptError::InvalidIrq)?;
 
     interrupt_handlers
         .register(irq_id, move || unsafe {

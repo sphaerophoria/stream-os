@@ -1,4 +1,5 @@
 use crate::{
+    interrupts::IrqId,
     io::io_allocator::{IoAllocator, IoOffset, IoRange},
     util::bit_manipulation::{GetBits, SetBits},
 };
@@ -191,6 +192,9 @@ pub struct PciInterfaceId {
 }
 
 #[derive(Debug)]
+pub struct InvalidIrq;
+
+#[derive(Debug)]
 pub struct GeneralPciDevice {
     addr: PciAddress,
 }
@@ -251,10 +255,17 @@ impl GeneralPciDevice {
         self.addr.enable_bus_mastering(pci);
     }
 
-    pub fn get_irq_num(&mut self, pci: &mut Pci) -> u8 {
+    pub fn get_irq_num(&mut self, pci: &mut Pci) -> Result<IrqId, InvalidIrq> {
         let reg = self.addr.read_register(pci, 0xf);
-        let irq = reg.get_bits(0, 8);
-        irq as u8
+        let irq = reg.get_bits(0, 8) as u8;
+
+        if irq < 8 {
+            Ok(IrqId::Pic1(irq))
+        } else if irq < 16 {
+            Ok(IrqId::Pic2(irq - 8))
+        } else {
+            Err(InvalidIrq)
+        }
     }
 }
 
