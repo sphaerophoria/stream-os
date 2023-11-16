@@ -4,6 +4,7 @@ use crate::{
     io::io_allocator::IoOffset,
     util::{
         async_channel::{self, Receiver, Sender},
+        bit_manipulation::GetBits,
         oneshot::{self, Sender as OneshotSender},
     },
 };
@@ -572,32 +573,64 @@ where
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum EndpointAddress {
+    In(u8),
+    Out(u8),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum TransferType {
+    Control,
+    Isochronus,
+    Bulk,
+    Interrupt,
+    Unknown,
+}
+
 pub struct UsbEndpointDescriptor<T>(T);
 
 impl<T> UsbEndpointDescriptor<T>
 where
     T: AsRef<[u8]>,
 {
-    fn length(&self) -> u8 {
+    pub fn length(&self) -> u8 {
         self.0.as_ref()[0]
     }
-    fn descriptor_type(&self) -> u8 {
+    pub fn descriptor_type(&self) -> u8 {
         self.0.as_ref()[1]
     }
-    fn endpoint_address(&self) -> u8 {
-        self.0.as_ref()[2]
+    pub fn endpoint_address(&self) -> EndpointAddress {
+        let val = self.0.as_ref()[2];
+        let address = val.get_bits(0, 4);
+        match val.get_bit(7) {
+            false => EndpointAddress::Out(address),
+            true => EndpointAddress::In(address),
+        }
     }
-    fn attributes(&self) -> u8 {
+
+    pub fn attributes(&self) -> u8 {
         self.0.as_ref()[3]
     }
-    fn max_packet_size(&self) -> u16 {
+
+    pub fn transfer_type(&self) -> TransferType {
+        match self.attributes().get_bits(0, 2) {
+            0 => TransferType::Control,
+            1 => TransferType::Isochronus,
+            2 => TransferType::Bulk,
+            3 => TransferType::Interrupt,
+            _ => TransferType::Unknown,
+        }
+    }
+
+    pub fn max_packet_size(&self) -> u16 {
         u16::from_le_bytes(
             self.0.as_ref()[4..6]
                 .try_into()
                 .expect("Failed to cast to 2 byte array"),
         )
     }
-    fn interval(&self) -> u8 {
+    pub fn interval(&self) -> u8 {
         self.0.as_ref()[6]
     }
 }

@@ -1,6 +1,8 @@
 use crate::{
     cursor,
-    usb::{Pid, UsbDevice, UsbPacket, UsbServiceHandle},
+    usb::{
+        EndpointAddress, Pid, TransferType, UsbDescriptor, UsbDevice, UsbPacket, UsbServiceHandle,
+    },
     util::async_channel::Sender,
 };
 
@@ -28,12 +30,16 @@ impl Mouse {
     }
 
     pub async fn service(&mut self) {
+        let endpoint = find_appropriate_endpoint(&self.device, &self.usb_tx)
+            .await
+            .expect("Failed to find endpoint");
+
         let mut data_toggle = false;
         loop {
             let read_packet = UsbPacket {
                 // FIXME: Set address and endpoint
                 address: self.device.address,
-                endpoint: 1,
+                endpoint,
                 data_toggle,
                 pid: Pid::In,
                 data: vec![0; 8],
@@ -54,4 +60,41 @@ impl Mouse {
                 .await;
         }
     }
+}
+
+async fn find_appropriate_endpoint(
+    device: &UsbDevice,
+    usb_service: &UsbServiceHandle,
+) -> Option<u8> {
+    let configurations = usb_service
+        .get_configuration_descriptors(device.address)
+        .await;
+
+    let mut in_relevant_interface = false;
+    for descriptor in &configurations {
+        if let UsbDescriptor::Interface(intf) = &descriptor {
+            in_relevant_interface = intf.interface_class() == 3
+                && intf.interface_subclass() == 1
+                && intf.interface_protocol() == 2;
+        }
+
+        if !in_relevant_interface {
+            continue;
+        }
+
+        let endpoint = match descriptor {
+            UsbDescriptor::Endpoint(endpoint) => endpoint,
+            _ => continue,
+        };
+
+        if endpoint.transfer_type() != TransferType::Interrupt {
+            continue;
+        }
+
+        if let EndpointAddress::In(address) = endpoint.endpoint_address() {
+            return Some(address);
+        }
+    }
+
+    None
 }
