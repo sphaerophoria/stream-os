@@ -20,6 +20,7 @@ There is no real goal, other than understanding computers better. We will implem
 - Graphics
 - Keyboard
 - Multicore
+- USB (1.1, no hub, mouse only)
 
 ## Usage
 
