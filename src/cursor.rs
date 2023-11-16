@@ -43,7 +43,7 @@ impl Cursor {
             pos.x = pos.x.clamp(0.0, 1.0);
             pos.y += movement.y;
             pos.y = pos.y.clamp(0.0, 1.0);
-            info!("cursor pos: {:?}", pos);
+            debug!("cursor pos: {:?}", pos);
             self.pos.write(pos).await;
         }
     }
