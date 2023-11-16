@@ -289,6 +289,7 @@ impl Kernel {
                     &mut pci,
                     Arc::clone(&monotonic_time),
                     wakeup_requester.clone(),
+                    interrupt_handlers,
                 ));
             }
         }

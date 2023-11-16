@@ -123,12 +123,13 @@ unsafe fn set_interrupt_mask(base: *mut u8) {
     interrupt_mask_reg.write_volatile(0x5);
 }
 
-unsafe fn clear_interrupt(base: *mut u8) {
+unsafe fn clear_interrupt(base: *mut u8) -> bool {
     let reg = base.add(INTERRUPT_STATUS_OFFSET) as *mut u16;
     // According to the OSDev wiki, we need to both read _and_ write the register to clear the
     // interrupt
-    reg.read_volatile();
+    let val = reg.read_volatile();
     reg.write_volatile(0x05);
+    val & 0x5 > 0
 }
 
 #[derive(Debug)]
@@ -150,7 +151,11 @@ unsafe fn init_interrupts(
 
     interrupt_handlers
         .register(irq_id, move || unsafe {
-            clear_interrupt(base);
+            let interrupt_fired = clear_interrupt(base);
+            if !interrupt_fired {
+                return;
+            }
+
             if let Some(waker) = service_waker.get() {
                 waker.wake_by_ref();
             }

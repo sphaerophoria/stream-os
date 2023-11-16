@@ -126,12 +126,12 @@ pub enum InitInterruptError {
 extern "C" fn generic_interrupt_handler(interrupt_number: u8) {
     let ret = (|| -> Result<(), InterruptHandlerError> {
         let mut handlers = INTERRUPT_HANDLER_DATA.handlers.lock();
-        let f = match handlers
+        let fns = match handlers
             .as_mut()
             .ok_or(InterruptHandlerError::NotInitialized)?
             .get_mut(&interrupt_number)
         {
-            Some(f) => f,
+            Some(fns) => fns,
             None => {
                 panic!(
                     "no handler for interrupt {} on cpu {}",
@@ -140,7 +140,9 @@ extern "C" fn generic_interrupt_handler(interrupt_number: u8) {
                 );
             }
         };
-        f();
+        for f in fns {
+            f();
+        }
 
         // Secondary processors use APIC not PIC
         if multiprocessing::cpuid() != multiprocessing::BSP_ID {
@@ -202,6 +204,7 @@ const PIC1_OFFSET: u8 = 0x40;
 const PIC2_OFFSET: u8 = 0x48;
 
 #[allow(unused)]
+#[derive(Debug)]
 pub enum IrqId {
     Internal(u8),
     Pic1(u8),
@@ -215,7 +218,7 @@ struct PicIo {
 
 pub struct InterruptHandlerData {
     #[allow(clippy::type_complexity)]
-    handlers: InterruptGuarded<Option<HashMap<u8, Box<dyn FnMut()>>>>,
+    handlers: InterruptGuarded<Option<HashMap<u8, Vec<Box<dyn FnMut()>>>>>,
     pic_io: InterruptGuarded<Option<PicIo>>,
 }
 
@@ -255,11 +258,8 @@ impl InterruptHandlerData {
                 .as_mut()
                 .ok_or(InterruptHandlerRegisterError::NotInitialized)?;
 
-            assert!(
-                !handlers.contains_key(&interrupt_num),
-                "Handlers should only be registered once per interrupt"
-            );
-            handlers.insert(interrupt_num, Box::new(f));
+            let id_handlers = handlers.entry(interrupt_num).or_default();
+            id_handlers.push(Box::new(f));
         }
 
         match irq_id {

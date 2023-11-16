@@ -58,6 +58,7 @@ pub struct OffsetOutOfRange {
     length: u16,
 }
 
+#[derive(Debug)]
 pub struct IoRange {
     addr: u16,
     length: u16,

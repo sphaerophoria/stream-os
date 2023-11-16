@@ -1,11 +1,15 @@
 use crate::{
+    interrupts::InterruptHandlerData,
     io::{
         io_allocator::{IoAllocator, IoOffset, IoRange},
         pci::{GeneralPciDevice, Pci},
     },
     sleep::WakeupRequester,
     time::MonotonicTime,
-    util::bit_manipulation::{GetBits, SetBits},
+    util::{
+        bit_manipulation::{GetBits, SetBits},
+        lock_free_queue::{self, Sender},
+    },
 };
 
 use super::{Pid, UsbPacket};
@@ -13,7 +17,7 @@ use super::{Pid, UsbPacket};
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
 use core::{
     future::Future,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 const USB_CMD_OFFSET: IoOffset = IoOffset::new(0);
@@ -152,8 +156,7 @@ impl UsbPortStatus {
 
 pub struct UhciFuture<'a> {
     buffers: &'a mut BTreeMap<u64, Box<TransferDescriptorStorage>>,
-    time: Arc<MonotonicTime>,
-    wakeup_requester: WakeupRequester,
+    waker_tx: &'a Sender<Waker>,
     ids: Vec<u64>,
 }
 
@@ -168,13 +171,10 @@ impl Future for UhciFuture<'_> {
                 // If bit 23 is set, the usb hardware hasn't flagged this descriptor as serviced
                 // yet
                 if status_word.get_bit(23) {
-                    let tick = self.time.get();
-                    let wakeup_tick = tick as f32 + 0.1 * self.time.tick_freq();
-                    let fut = self
-                        .wakeup_requester
-                        .register_wakeup_time(wakeup_tick as usize);
-                    let fut = core::pin::pin!(fut);
-                    let _ = fut.poll(cx);
+                    self.waker_tx
+                        .push(cx.waker().clone())
+                        .expect("USB waker queue too short");
+
                     return Poll::Pending;
                 }
             }
@@ -204,6 +204,7 @@ pub struct Uhci {
     last_id: u64,
     time: Arc<MonotonicTime>,
     wakeup_requester: WakeupRequester,
+    waker_tx: Sender<Waker>,
 }
 
 impl Uhci {
@@ -213,6 +214,7 @@ impl Uhci {
         pci: &mut Pci,
         time: Arc<MonotonicTime>,
         wakeup_requester: WakeupRequester,
+        interrupt_handlers: &InterruptHandlerData,
     ) -> Uhci {
         // By default set the terminate bit on each frame, we will adjust them later maybe
         let mut frame_list = unsafe {
@@ -224,10 +226,10 @@ impl Uhci {
 
         let io_base = device
             .find_io_base(pci)
-            .expect("Failed to find io_base for uhci");
+            .expect("Failed to find io_base for uhci") as u16;
 
         let io_range = io_allocator
-            .request_io_range(io_base as u16, 20)
+            .request_io_range(io_base, 20)
             .expect("Failed to allocate IO range");
 
         let mut master_queue_head = QueueHead([0; 2]);
@@ -247,6 +249,45 @@ impl Uhci {
             );
         }
 
+        let irq_num = device.get_irq_num(pci).unwrap();
+        info!("Interrupt number for uhci card: {:?}", irq_num);
+        info!("uhci io range: {:?}", io_range);
+
+        let (waker_tx, mut waker_rx) = lock_free_queue::channel::<Waker>(50);
+
+        interrupt_handlers
+            .register(irq_num, move || {
+                // NOTE: Not using the io_range abstraction because piping of single mutable writer is
+                // too difficult, this status write should be atomic anyways
+                unsafe {
+                    let mut val: u16;
+                    core::arch::asm!("
+                                 in %dx, %ax
+                                 ",
+                                 in ("dx") io_base + 2,
+                                 out ("ax") val,
+                                 options(att_syntax));
+
+                    if !val.get_bit(0) {
+                        return;
+                    }
+                }
+
+                while let Some(waker) = waker_rx.pop() {
+                    waker.wake();
+                }
+
+                unsafe {
+                    core::arch::asm!("
+                                 out %ax, %dx
+                                 ",
+                                 in ("dx") io_base + 2,
+                                 in ("ax") 1,
+                                 options(att_syntax));
+                }
+            })
+            .expect("Failed to register interrupt handler");
+
         Uhci {
             frame_list,
             io_range,
@@ -254,6 +295,7 @@ impl Uhci {
             last_id: 0,
             time,
             wakeup_requester,
+            waker_tx,
         }
     }
 
@@ -294,8 +336,7 @@ impl Uhci {
 
         UhciFuture {
             buffers: &mut self.master_queue.bufs,
-            time: Arc::clone(&self.time),
-            wakeup_requester: self.wakeup_requester.clone(),
+            waker_tx: &self.waker_tx,
             ids,
         }
     }
@@ -456,12 +497,17 @@ impl Uhci {
         val.port_enabled() && val.connected()
     }
 
+    fn enable_interrupts(&mut self) {
+        self.io_range.write_16(IoOffset::new(4), 1 << 2).unwrap();
+    }
+
     pub async fn init(&mut self) {
         self.reset().await;
         self.set_frame_list_offset();
         self.set_frame_number(0);
         self.clear_usb_status();
         self.enable_uhci_card();
+        self.enable_interrupts();
     }
 }
 
@@ -706,6 +752,11 @@ fn chain_tds(tds: &mut [Box<TransferDescriptorStorage>]) {
             .descriptor
             .set_link_pointer(&LinkPointer::TD(second_ptr));
     }
+
+    tds.last_mut()
+        .unwrap()
+        .descriptor
+        .set_interrupt_on_complete(true);
 }
 
 fn generate_td(packet: UsbPacket) -> Result<Box<TransferDescriptorStorage>, InvalidPacketErr> {
