@@ -29,6 +29,7 @@ impl<'a, T> DerefMut for SpinLockGuard<'a, T> {
     }
 }
 
+#[derive(Debug)]
 pub struct SpinLock<T> {
     inner: UnsafeCell<T>,
     available: AtomicBool,

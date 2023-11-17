@@ -56,9 +56,12 @@ use multiprocessing::Apic;
 
 use core::{
     arch::global_asm,
+    cell::UnsafeCell,
+    future::Future,
+    mem::MaybeUninit,
     panic::PanicInfo,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 use hashbrown::HashMap;
 
@@ -88,6 +91,7 @@ use crate::{
     usb::{uhci::Uhci, Usb, UsbDescriptor},
     util::async_mutex::Mutex,
     util::interrupt_guard::InterruptGuarded,
+    util::spinlock::SpinLock,
 };
 
 // Include boot.s which defines _start as inline assembly in main. This allows us to do more fine
@@ -205,7 +209,7 @@ struct Kernel {
     rng: Mutex<Rng>,
     rtc: Rtc,
     pci: Pci,
-    ps2: Ps2Keyboard,
+    ps2: SpinLock<Ps2Keyboard>,
     rtl8139: Rtl8139,
     usb: Usb,
     arp_table: ArpTable,
@@ -309,7 +313,7 @@ impl Kernel {
 
         let framebuffer = FrameBuffer::new(framebuffer_info);
 
-        let ps2 = Ps2Keyboard::new(&mut io_allocator, interrupt_handlers);
+        let ps2 = SpinLock::new(Ps2Keyboard::new(&mut io_allocator, interrupt_handlers));
 
         let rsdp = info.get_rsdp().expect("Failed to get rsdp");
         if !rsdp.validate_checksum() {
@@ -483,14 +487,45 @@ impl Kernel {
             recv_loop(&self.rtl8139, &self.arp_table, &self.tcp, &self.rng).await;
         };
 
-        let mouse_move_tx = self.cursor.get_movement_writer();
-        let mut game = game::Game::new(
-            &mut self.framebuffer,
-            &mut self.ps2,
-            &self.monotonic_time,
-            &self.wakeup_requester,
-            self.cursor.get_pos_reader(),
-        );
+        //let mouse_move_tx = self.cursor.get_movement_writer();
+        let (mouse_move_tx, mouse_move_rx) = util::async_channel::channel();
+
+        let doom = async {
+            doomgeneric_Create(0, core::ptr::null());
+            let tick_freq = 1.0 / self.monotonic_time.tick_freq();
+
+            loop {
+                let start = self.monotonic_time.get();
+
+                let mut movement = cursor::Movement { x: 0.0, y: 0.0 };
+                loop {
+                    let this_movement = mouse_move_rx.try_recv().await;
+                    let this_movement: cursor::Movement = match this_movement {
+                        Some(v) => v,
+                        None => break,
+                    };
+                    movement.x += this_movement.x;
+                    movement.y += this_movement.y;
+                }
+                doomgeneric_PushMouse(movement.x, movement.y);
+                doomgeneric_Tick();
+                let end = self.monotonic_time.get();
+                crate::sleep::sleep(
+                    0.033 - ((end - start) as f32 * tick_freq),
+                    &self.monotonic_time,
+                    &self.wakeup_requester,
+                )
+                .await;
+            }
+        };
+
+        //let mut game = game::Game::new(
+        //    &mut self.framebuffer,
+        //    &mut self.ps2,
+        //    &self.monotonic_time,
+        //    &self.wakeup_requester,
+        //    self.cursor.get_pos_reader(),
+        //);
 
         let device_rx = self.usb.device_channel();
         let usb_handle = self.usb.handle();
@@ -525,13 +560,14 @@ impl Kernel {
         executor.spawn(echo_tcp);
         executor.spawn(tcp_service);
         executor.spawn(send_udp);
-        executor.spawn(game.run());
+        //executor.spawn(game.run());
         executor.spawn(self.wakeup_service.service());
         executor.spawn(self.rtl8139.service());
         executor.spawn(self.cpu_dispatcher.service());
         executor.spawn(self.usb.service());
         executor.spawn(usb_driver_dispatch);
         executor.spawn(self.cursor.service());
+        executor.spawn(doom);
         executor.run();
 
         info!("And now we exit/halt");
@@ -808,22 +844,148 @@ async unsafe fn test_and_wait(monotonic_time: Arc<MonotonicTime>) {
     io::exit(0);
 }
 
+extern "C" {
+    static DG_ScreenBuffer: *mut u32;
+    fn doomgeneric_Create(argc: i32, argv: *const *const u8);
+    fn doomgeneric_PushMouse(x: f32, y: f32);
+    fn doomgeneric_Tick();
+    fn test_printf();
+    fn print_long_size();
+}
+
+pub struct StaticKernel(UnsafeCell<MaybeUninit<Kernel>>);
+unsafe impl Sync for StaticKernel {}
+
+impl StaticKernel {
+    fn get<'a, 'b>(&'a self) -> &'b mut Kernel {
+        unsafe {
+            let maybe_unint_kernel = &mut *self.0.get();
+            maybe_unint_kernel.assume_init_mut()
+        }
+    }
+}
+
+static KERNEL: StaticKernel = StaticKernel(UnsafeCell::new(MaybeUninit::uninit()));
+
+#[no_mangle]
+pub unsafe extern "C" fn DG_GetTicksMs() -> u32 {
+    let kernel = KERNEL.get();
+    let tick = kernel.monotonic_time.get();
+    let tick_freq = kernel.monotonic_time.tick_freq();
+    let ticks_ms_f = (1.0 / tick_freq) /* s / tick */ * tick as f32 /* tick */ * 1000.0 /* s -> ms */;
+    ticks_ms_f as u32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn DG_DrawFrame() {
+    let kernel = KERNEL.get();
+
+    let res_x = 640;
+    let res_y = 400;
+
+    let mut line_start = kernel.framebuffer.info.addr;
+    let mut from_ptr = DG_ScreenBuffer as *mut u8;
+    for _ in 0..res_y {
+        line_start.copy_from(from_ptr, res_x * 4);
+
+        from_ptr = from_ptr.add(res_x * 4);
+        line_start = line_start.add(kernel.framebuffer.info.pitch as usize)
+    }
+}
+
+const RAW_WAKER_VTABLE: RawWakerVTable =
+    RawWakerVTable::new(clone, null_future_fn, null_future_fn, null_future_fn);
+
+unsafe fn clone(_: *const ()) -> RawWaker {
+    RawWaker::new(core::ptr::null(), &RAW_WAKER_VTABLE)
+}
+
+unsafe fn null_future_fn(data: *const ()) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn DG_GetKey(pressed: *mut i32, doom_key: *mut u8) -> i32 {
+    let kernel = KERNEL.get();
+
+    let mut ps2 = kernel.ps2.lock();
+    let read_fut = ps2.read();
+    let mut read_fut = core::pin::pin!(read_fut);
+
+    let waker = RawWaker::new(core::ptr::null(), &RAW_WAKER_VTABLE);
+    let waker = Waker::from_raw(waker);
+    let mut context = Context::from_waker(&waker);
+    let scancode: u8 = match read_fut.poll(&mut context) {
+        Poll::Ready(v) => v,
+        Poll::Pending => {
+            return 0;
+        }
+    };
+
+    println!("Got scancode: {}", scancode);
+
+    const DOOM_KEY_RIGHTARROW: u8 = 0xae;
+    const DOOM_KEY_LEFTARROW: u8 = 0xac;
+    const DOOM_KEY_UPARROW: u8 = 0xad;
+    const DOOM_KEY_DOWNARROW: u8 = 0xaf;
+    const DOOM_KEY_STRAFE_L: u8 = 0xa0;
+    const DOOM_KEY_STRAFE_R: u8 = 0xa1;
+    const DOOM_KEY_USE: u8 = 0xa2;
+    const DOOM_KEY_FIRE: u8 = 0xa3;
+    const DOOM_KEY_ESCAPE: u8 = 27;
+    const DOOM_KEY_ENTER: u8 = 13;
+
+    const W_DOWN: u8 = 0x11;
+    const A_DOWN: u8 = 0x1e;
+    const S_DOWN: u8 = 0x1f;
+    const D_DOWN: u8 = 0x20;
+    const E_DOWN: u8 = 0x12;
+    const CTRL_DOWN: u8 = 0x1d;
+    const ENTER_DOWN: u8 = 0x1c;
+    const ESC_DOWN: u8 = 0x01;
+
+    *doom_key = match scancode & 0x7f {
+        W_DOWN => DOOM_KEY_UPARROW,
+        A_DOWN => DOOM_KEY_STRAFE_L,
+        S_DOWN => DOOM_KEY_DOWNARROW,
+        D_DOWN => DOOM_KEY_STRAFE_R,
+        E_DOWN => DOOM_KEY_USE,
+        CTRL_DOWN => DOOM_KEY_FIRE,
+        ENTER_DOWN => DOOM_KEY_ENTER,
+        ESC_DOWN => DOOM_KEY_ESCAPE,
+        _ => 0,
+    };
+
+    *pressed = 1 - (scancode >> 7) as i32;
+    println!("{:#x}, {}", scancode, *pressed);
+
+    return 1;
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn kernel_main(multiboot_magic: u32, info: *const u8) -> i32 {
-    let mut kernel = Kernel::init(multiboot_magic, info).expect("Failed to initialize kernel");
+    (*KERNEL.0.get()) =
+        MaybeUninit::new(Kernel::init(multiboot_magic, info).expect("Failed to initialize kernel"));
 
-    #[cfg(test)]
-    {
-        let mut executor = Executor::new(None);
-        executor.spawn(logger::service());
-        executor.spawn(test_and_wait(Arc::clone(&kernel.monotonic_time)));
-        executor.run();
-    }
+    //test_printf();
+    //
+    //print_long_size();
+    //#[cfg(test)]
+    //{
+    //    let mut executor = Executor::new(None);
+    //    executor.spawn(logger::service());
+    //    executor.spawn(test_and_wait(Arc::clone(&kernel.monotonic_time)));
+    //    executor.run();
+    //}
 
-    kernel.demo();
+    KERNEL.get().demo();
 
     io::exit(0);
     0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn panic_c(s: *const i8) {
+    let s = core::ffi::CStr::from_ptr(s);
+    panic!("{}", s.to_str().unwrap());
 }
 
 /// This function is called on panic.

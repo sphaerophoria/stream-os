@@ -4,7 +4,7 @@ use crate::multiboot2::FrameBufferInfo;
 pub struct Color(u32);
 
 pub struct FrameBuffer {
-    info: FrameBufferInfo,
+    pub info: FrameBufferInfo,
 }
 
 impl FrameBuffer {

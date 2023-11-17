@@ -100,6 +100,11 @@ pub unsafe fn init(info: &Multiboot2) {
     ALLOC.first_free.store(segment, Ordering::Relaxed);
 }
 
+pub unsafe fn get_size_for_allocation(ptr: *mut u8) -> usize {
+    let header_ptr = get_header_ptr_from_allocated(ptr);
+    (*header_ptr).size
+}
+
 unsafe fn find_header_for_allocation(segment: &FreeSegment, layout: &Layout) -> Option<*mut u8> {
     let segment_start: *mut u8 = segment.get_start();
     let segment_end: *mut u8 = segment.get_end();

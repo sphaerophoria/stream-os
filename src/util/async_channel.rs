@@ -64,6 +64,10 @@ impl<T> Receiver<T> {
     pub async fn recv(&self) -> T {
         ReceiverWaiter { inner: &self.inner }.await
     }
+
+    pub async fn try_recv(&self) -> Option<T> {
+        self.inner.lock().await.queue.pop_front()
+    }
 }
 
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {

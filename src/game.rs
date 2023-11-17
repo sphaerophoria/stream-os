@@ -215,6 +215,10 @@ impl<'a> Game<'a> {
             let next_frame_time = start + (DELTA * self.monotonic_time.tick_freq()) as usize;
 
             let now = self.monotonic_time.get();
+            if next_frame_time < now {
+                continue;
+            }
+
             let remaining_s = (next_frame_time - now) as f32 / self.monotonic_time.tick_freq();
             let mut sleep_fut = core::pin::pin!(sleep::sleep(
                 remaining_s,

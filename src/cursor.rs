@@ -3,6 +3,7 @@ use crate::util::{
     updated_val::UpdatedVal,
 };
 
+#[derive(Debug)]
 pub struct Movement {
     pub x: f32,
     pub y: f32,
