@@ -529,7 +529,7 @@ impl Tcp {
 
                     state.incoming_ack_num = frame.ack_num();
 
-                    if let Some(unacked_packet) = state.unacknowledged.get(0) {
+                    if let Some(unacked_packet) = state.unacknowledged.front() {
                         if unacked_packet.params.seq_num < frame.ack_num() {
                             state.unacknowledged.pop_front();
                         }
