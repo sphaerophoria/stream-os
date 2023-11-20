@@ -180,9 +180,10 @@ impl Future for UhciFuture<'_> {
             }
         }
 
+        let self_unpin = &mut *self;
         let mut ret = Vec::new();
-        for id in self.ids.clone() {
-            let mut buf = self.buffers.remove(&id).expect("Failed to remove id");
+        for id in &self_unpin.ids {
+            let mut buf = self_unpin.buffers.remove(id).expect("Failed to remove id");
             buf.hw_sync();
             ret.push(buf.buf);
         }
