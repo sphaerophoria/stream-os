@@ -43,3 +43,14 @@ pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) {
     }
     memcpy(dest, copy.as_ptr() as *mut u8, n);
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn strlen(s: *const i8) -> usize {
+    let mut i = 0;
+    loop {
+        if *s.add(i) == 0 {
+            return i;
+        }
+        i += 1;
+    }
+}
