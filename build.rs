@@ -13,12 +13,4 @@ fn main() {
         .expect("Failed to run build for sample program");
 
     println!("cargo:rerun-if-changed=res/sample_program");
-
-    let bindings = bindgen::builder()
-        .header("res/sample_program/vtable.h")
-        .generate()
-        .expect("Failed to generate vtable bindings");
-
-    let bindings_output_file = format!("{output_dir}/vtable.rs");
-    bindings.write_to_file(bindings_output_file).expect("Failed to write vtable bindings");
 }

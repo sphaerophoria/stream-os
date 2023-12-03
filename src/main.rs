@@ -520,9 +520,9 @@ impl Kernel {
         };
 
         info!("Spawning a process");
-        const SAMPLE_PROCESS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"),"/sample_program.elf"));
+        const SAMPLE_PROCESS: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/sample_program.elf"));
         process::run_process(SAMPLE_PROCESS);
-
 
         let mut executor = Executor::new(Some(&self.cpu_dispatcher));
         executor.spawn(logger::service());

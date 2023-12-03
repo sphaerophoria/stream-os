@@ -1,5 +1,5 @@
-use elf::endian::EndianParse;
 use core::arch::global_asm;
+use elf::endian::EndianParse;
 
 use alloc::vec;
 
@@ -41,12 +41,10 @@ unsafe extern "C" fn c_print(data: *const i8) {
     print!("{}", s.to_str().unwrap());
 }
 
-
 unsafe extern "C" fn c_panic(data: *const i8) {
     let s = core::ffi::CStr::from_ptr(data);
     panic!("{}", s.to_str().unwrap());
 }
-
 
 #[repr(C)]
 struct vtable {
@@ -67,17 +65,24 @@ fn get_min_max_mapped_address<E: EndianParse>(data: &elf::ElfBytes<E>) -> (u64, 
     (smallest_address, largest_address)
 }
 
-
 pub fn run_process(elf_file: &[u8]) {
-    let data = elf::ElfBytes::<elf::endian::LittleEndian>::minimal_parse(elf_file).expect("Failed to parse elf");
+    let data = elf::ElfBytes::<elf::endian::LittleEndian>::minimal_parse(elf_file)
+        .expect("Failed to parse elf");
     let (min_addr, max_addr) = get_min_max_mapped_address(&data);
 
-    let mut mapped_process = vec![0u8; (max_addr - min_addr).try_into().expect("process space > usize")];
+    let mut mapped_process = vec![
+        0u8;
+        (max_addr - min_addr)
+            .try_into()
+            .expect("process space > usize")
+    ];
 
     let segments = data.segments().expect("Failed to get segments");
     for segment in segments.iter().filter(|s| s.p_type == 1) {
         let desired_v_addr = segment.p_vaddr;
-        let mapped_addr = (desired_v_addr - min_addr).try_into().expect("Mapped address does not fit in usize");
+        let mapped_addr = (desired_v_addr - min_addr)
+            .try_into()
+            .expect("Mapped address does not fit in usize");
         let source_start = segment.p_offset as usize;
         let source_end = source_start + segment.p_filesz as usize;
         let dest_end = mapped_addr + segment.p_filesz as usize;
@@ -90,12 +95,25 @@ pub fn run_process(elf_file: &[u8]) {
         panic: c_panic,
     };
 
-    println!("Offset for start: {}", (data.ehdr.e_entry - min_addr) as usize);
+    println!(
+        "Offset for start: {}",
+        (data.ehdr.e_entry - min_addr) as usize
+    );
 
-    println!("Arg 1: {:?}", mapped_process.as_ptr().add((data.ehdr.e_entry - min_addr) as usize));
+    println!(
+        "Arg 1: {:?}",
+        mapped_process
+            .as_ptr()
+            .add((data.ehdr.e_entry - min_addr) as usize)
+    );
     println!("Arg 2: {:?}", &vtable as *const vtable);
 
     unsafe {
-        load_process(mapped_process.as_ptr().add((data.ehdr.e_entry - min_addr) as usize), &vtable as *const vtable);
+        load_process(
+            mapped_process
+                .as_ptr()
+                .add((data.ehdr.e_entry - min_addr) as usize),
+            &vtable as *const vtable,
+        );
     }
 }
